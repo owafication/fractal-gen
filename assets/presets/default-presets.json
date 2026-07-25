@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "note": "Reference copy of the built-in presets. The executable uses the typed defaults in Core/Models.cpp so startup does not depend on external files.",
+  "presets": [
+    {"id":"full-view","name":"Full Mandelbrot View","centreX":-0.5,"centreY":0.0,"scale":1.5,"iterations":280,"palette":"classic-spectrum","animationMode":"automatic-journey"},
+    {"id":"seahorse-valley","name":"Seahorse Valley","centreX":-0.743643887037151,"centreY":0.13182590420533,"scale":0.0065,"iterations":650,"palette":"deep-ocean","animationMode":"continuous-zoom"},
+    {"id":"elephant-valley","name":"Elephant Valley","centreX":0.285,"centreY":0.01,"scale":0.045,"iterations":520,"palette":"gold","animationMode":"continuous-zoom"},
+    {"id":"double-spiral","name":"Double Spiral","centreX":-0.777807810193171,"centreY":0.131645108003206,"scale":0.00085,"iterations":820,"palette":"purple-neon","animationMode":"static-animated-colour"},
+    {"id":"mini-mandelbrot","name":"Mini Mandelbrot","centreX":-1.25066,"centreY":0.02012,"scale":0.012,"iterations":650,"palette":"classic-spectrum","animationMode":"continuous-zoom"},
+    {"id":"deep-blue","name":"Deep Blue","centreX":-0.7453,"centreY":0.1127,"scale":0.025,"iterations":560,"palette":"deep-ocean","animationMode":"static-animated-colour"},
+    {"id":"fire","name":"Fire","centreX":-0.16,"centreY":1.0405,"scale":0.015,"iterations":640,"palette":"fire","animationMode":"static-animated-colour"},
+    {"id":"monochrome","name":"Monochrome","centreX":-0.5,"centreY":0.0,"scale":1.45,"iterations":350,"palette":"greyscale","animationMode":"automatic-journey"},
+    {"id":"neon","name":"Neon","centreX":-0.743,"centreY":0.131,"scale":0.018,"iterations":620,"palette":"purple-neon","animationMode":"continuous-zoom"},
+    {"id":"slow-ambient","name":"Slow Ambient Zoom","centreX":-0.75,"centreY":0.0,"scale":0.9,"iterations":420,"palette":"pastel","animationMode":"automatic-journey"}
+  ]
+}
