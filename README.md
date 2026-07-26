@@ -2,6 +2,8 @@
 
 A native, offline Windows 10/11 desktop application that renders an animated Mandelbrot set behind desktop icons.
 
+![Mandelbrot Live Wallpaper preview](docs/images/fractal-gen.png)
+
 ## Implemented scope
 
 - GPU Mandelbrot rendering through Direct3D 11/HLSL by default, with automatic OpenGL/GLSL fallback and a static CPU-rendered fallback.
