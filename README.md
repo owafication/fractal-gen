@@ -2,9 +2,11 @@
 
 A native, offline Windows 10/11 desktop application that renders an animated Mandelbrot set behind desktop icons.
 
+## v1.11.7
+
 <img width="900" alt="fractal-gen" src="https://github.com/user-attachments/assets/06437913-e262-47e0-9435-6da304ba2df1" />
-<img width="1080" alt="static-render-1785048857384" src="https://github.com/user-attachments/assets/6f905026-0fc2-4c1c-9891-fa0584a6d8a5" />
-<img width="900" alt="phone wallpaper low res6" src="https://github.com/user-attachments/assets/68f28179-30db-44ad-99a3-653b4a8fb5d2" />
+
+
 
 
 ## Implemented scope
@@ -60,6 +62,19 @@ The palette editor exposes 30 reusable built-in palettes. Eight are matched to t
 - Optional: Inno Setup 6 to produce the installer.
 
 No third-party runtime or package-manager dependency is required.
+
+## Render across 3 displays
+
+<img width="1080" alt="static-render-1785048857384" src="https://github.com/user-attachments/assets/6f905026-0fc2-4c1c-9891-fa0584a6d8a5" />
+
+## Phone Wallpaper Renders
+
+<p align="center">
+  <img width="300" alt="phone wallpaper low res6" src="https://github.com/user-attachments/assets/68f28179-30db-44ad-99a3-653b4a8fb5d2" />
+  <img width="300" alt="phone wallpaper low res5" src="https://github.com/user-attachments/assets/f18733a5-b398-4b85-8b65-23ad1de25976" />
+  <img width="300" alt="phone wallpaper low res" src="https://github.com/user-attachments/assets/d076776d-29db-426c-8f91-c3d987e5e92c" />
+
+</p>
 
 ## Build
 
