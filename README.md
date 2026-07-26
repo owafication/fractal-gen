@@ -63,9 +63,11 @@ The palette editor exposes 30 reusable built-in palettes. Eight are matched to t
 
 No third-party runtime or package-manager dependency is required.
 
-## Render across 3 displays
+## Rendered across 3 displays
 
 <img width="1080" alt="static-render-1785048857384" src="https://github.com/user-attachments/assets/6f905026-0fc2-4c1c-9891-fa0584a6d8a5" />
+<img width="1080" alt="Untitled2" src="https://github.com/user-attachments/assets/576d5c85-2d8e-468b-9aa8-a801811fae4b" />
+
 
 ## Phone Wallpaper Renders
 
@@ -75,6 +77,11 @@ No third-party runtime or package-manager dependency is required.
   <img width="300" alt="phone wallpaper low res" src="https://github.com/user-attachments/assets/d076776d-29db-426c-8f91-c3d987e5e92c" />
 
 </p>
+
+## Youtube
+
+[![Watch the demo](https://img.youtube.com/vi/W0WSDyZutdM/maxresdefault.jpg)](https://www.youtube.com/watch?v=W0WSDyZutdM)
+
 
 ## Build
 
