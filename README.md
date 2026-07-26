@@ -4,7 +4,7 @@ A native, offline Windows 10/11 desktop application that renders an animated Man
 
 <img width="900" alt="fractal-gen" src="https://github.com/user-attachments/assets/06437913-e262-47e0-9435-6da304ba2df1" />
 <img width="1080" alt="static-render-1785048857384" src="https://github.com/user-attachments/assets/6f905026-0fc2-4c1c-9891-fa0584a6d8a5" />
-<img width="1440" height="3120" alt="phone wallpaper low res6" src="https://github.com/user-attachments/assets/68f28179-30db-44ad-99a3-653b4a8fb5d2" />
+<img width="900" alt="phone wallpaper low res6" src="https://github.com/user-attachments/assets/68f28179-30db-44ad-99a3-653b4a8fb5d2" />
 
 
 ## Implemented scope
