@@ -33,7 +33,8 @@ enum Id : int {
     InitialModeCombo, InitialReal, InitialImag, JuliaCheck, JuliaReal, JuliaImag, BailoutEdit,
     RenderModeCombo, NewtonDegreeEdit, NewtonTargetReal, NewtonTargetImag,
     NewtonRelaxReal, NewtonRelaxImag, NewtonToleranceEdit,
-    ColouringCombo, TrapCombo, TrapReal, TrapImag, TrapRadiusEdit, GlowEdit, DepthEdit,
+    ColouringCombo, TrapCombo, TrapReal, TrapImag, TrapRadiusEdit, GlowEdit, BloomThresholdEdit,
+    BloomSoftKneeEdit, BloomRadiusEdit, EdgeLightEdit, DepthEdit,
     AnimateCheck, AnimationSpeedEdit, AnimationAmplitudeEdit, RandomiseButton,
     ResetButton, OkButton, CancelButton,
 };
@@ -45,6 +46,7 @@ struct State {
     Preset* preset{};
     std::vector<EquationPreset>* saved{};
     EquationSettings original;
+    std::function<void()> onChanged;
     HFONT font{};
     ResponsiveDialogLayout layout;
     DialogTooltipManager tooltips;
@@ -170,7 +172,12 @@ void Populate(HWND window, const EquationSettings& equation) {
     SetCombo(window, TrapCombo, static_cast<int>(equation.orbitTrap));
     SetText(window, TrapReal, equation.orbitTrapPoint.real); SetText(window, TrapImag, equation.orbitTrapPoint.imaginary);
     SetText(window, TrapRadiusEdit, equation.orbitTrapRadius);
-    SetText(window, GlowEdit, equation.glowStrength); SetText(window, DepthEdit, equation.depthStrength);
+    SetText(window, GlowEdit, equation.glowStrength);
+    SetText(window, BloomThresholdEdit, equation.bloomThreshold);
+    SetText(window, BloomSoftKneeEdit, equation.bloomSoftKnee);
+    SetText(window, BloomRadiusEdit, equation.bloomRadius);
+    SetText(window, EdgeLightEdit, equation.edgeLightingStrength);
+    SetText(window, DepthEdit, equation.depthStrength);
     Check(window, AnimateCheck, equation.animateCoefficients);
     SetText(window, AnimationSpeedEdit, equation.coefficientAnimationSpeed);
     SetText(window, AnimationAmplitudeEdit, equation.coefficientAnimationAmplitude);
@@ -196,7 +203,12 @@ bool ReadEquation(HWND window, EquationSettings& equation) {
         !ReadDouble(window, NewtonToleranceEdit, equation.convergenceTolerance, 1.0e-12, 0.1) ||
         !ReadDouble(window, TrapReal, equation.orbitTrapPoint.real, -8, 8) || !ReadDouble(window, TrapImag, equation.orbitTrapPoint.imaginary, -8, 8) ||
         !ReadDouble(window, TrapRadiusEdit, equation.orbitTrapRadius, 1.0e-6, 8) ||
-        !ReadDouble(window, GlowEdit, equation.glowStrength, 0, 4) || !ReadDouble(window, DepthEdit, equation.depthStrength, 0, 4) ||
+        !ReadDouble(window, GlowEdit, equation.glowStrength, 0, 4) ||
+        !ReadDouble(window, BloomThresholdEdit, equation.bloomThreshold, 0, 4) ||
+        !ReadDouble(window, BloomSoftKneeEdit, equation.bloomSoftKnee, 0, 2) ||
+        !ReadInt(window, BloomRadiusEdit, equation.bloomRadius, 0, 16) ||
+        !ReadDouble(window, EdgeLightEdit, equation.edgeLightingStrength, 0, 4) ||
+        !ReadDouble(window, DepthEdit, equation.depthStrength, 0, 4) ||
         !ReadDouble(window, AnimationSpeedEdit, equation.coefficientAnimationSpeed, 0, 8) ||
         !ReadDouble(window, AnimationAmplitudeEdit, equation.coefficientAnimationAmplitude, 0, 2)) return false;
     equation.absoluteReal = Checked(window, AbsRealCheck); equation.absoluteImaginary = Checked(window, AbsImagCheck);
@@ -220,6 +232,7 @@ void Refresh(State& state) {
     }
     state.preset->equation = equation;
     SetWindowTextW(GetDlgItem(state.window, SummaryLabel), Wide(EquationSummary(equation)).c_str());
+    if (state.onChanged) state.onChanged();
 }
 
 void PopulateSaved(State& state) {
@@ -298,8 +311,8 @@ LRESULT CALLBACK Procedure(HWND window, UINT message, WPARAM wParam, LPARAM lPar
         state->font = CreateResponsiveDialogFont(state->dpi);
         Add(window, state->instance, WC_STATICW, L"Equation preview", SS_LEFT, 0, 14, 12, 110, 22, state->font);
         Add(window, state->instance, WC_STATICW, L"", SS_LEFT | SS_SUNKEN, SummaryLabel, 126, 8, 842, 34, state->font);
-        Add(window, state->instance, WC_STATICW, L"Built-in equation", SS_LEFT, 0, 14, 52, 122, 22, state->font);
-        HWND examples = Add(window, state->instance, WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_TABSTOP,
+        Add(window, state->instance, WC_STATICW, L"Fractal family / template", SS_LEFT, 0, 14, 52, 122, 22, state->font);
+        HWND examples = Add(window, state->instance, WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP,
                             ExampleCombo, 138, 48, 260, 360, state->font);
         for (const auto& name : EquationExampleNames()) {
             const auto wide = Wide(name); SendMessageW(examples, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(wide.c_str()));
@@ -307,7 +320,7 @@ LRESULT CALLBACK Procedure(HWND window, UINT message, WPARAM wParam, LPARAM lPar
         SendMessageW(examples, CB_SETCURSEL, 0, 0);
         Add(window, state->instance, WC_BUTTONW, L"Load", BS_PUSHBUTTON, LoadExampleButton, 404, 48, 64, 27, state->font);
         Add(window, state->instance, WC_STATICW, L"Saved", SS_LEFT, 0, 480, 52, 52, 22, state->font);
-        Add(window, state->instance, WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_TABSTOP, SavedCombo, 532, 48, 138, 180, state->font);
+        Add(window, state->instance, WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, SavedCombo, 532, 48, 138, 180, state->font);
         Add(window, state->instance, WC_EDITW, L"", ES_AUTOHSCROLL | WS_TABSTOP, SavedNameEdit, 676, 48, 126, 27, state->font, WS_EX_CLIENTEDGE);
         Add(window, state->instance, WC_BUTTONW, L"Load", BS_PUSHBUTTON, LoadSavedButton, 808, 48, 54, 27, state->font);
         Add(window, state->instance, WC_BUTTONW, L"New", BS_PUSHBUTTON, SaveNewButton, 866, 48, 48, 27, state->font);
@@ -325,12 +338,12 @@ LRESULT CALLBACK Procedure(HWND window, UINT message, WPARAM wParam, LPARAM lPar
         struct Row {const wchar_t* name;int r;int i;};
         const std::array<Row,6> rows{{{L"A · T(z)^p",AReal,AImag},{L"B · T(z)",BReal,BImag},{L"C · c^r",CReal,CImag},{L"D constant",DReal,DImag},{L"E · iteration",IterReal,IterImag},{L"λ / T(z)^q",ReciprocalReal,ReciprocalImag}}};
         for (const auto& row:rows){label(28,y+3,116,row.name);edit(150,y,76,row.r);edit(234,y,76,row.i);y+=34;}
-        label(28,y+4,112,L"Function"); HWND transform=Add(window,state->instance,WC_COMBOBOXW,L"",CBS_DROPDOWNLIST|WS_TABSTOP,TransformCombo,150,y,160,150,state->font);for(const wchar_t* value:{L"None",L"sin(z)",L"cos(z)",L"exp(z)",L"log(z)"})SendMessageW(transform,CB_ADDSTRING,0,reinterpret_cast<LPARAM>(value));y+=36;
+        label(28,y+4,112,L"Function"); HWND transform=Add(window,state->instance,WC_COMBOBOXW,L"",CBS_DROPDOWNLIST|WS_VSCROLL|WS_TABSTOP,TransformCombo,150,y,160,150,state->font);for(const wchar_t* value:{L"None",L"sin(z)",L"cos(z)",L"exp(z)",L"log(z)"})SendMessageW(transform,CB_ADDSTRING,0,reinterpret_cast<LPARAM>(value));y+=36;
         Add(window,state->instance,WC_BUTTONW,L"Absolute real",BS_AUTOCHECKBOX,AbsRealCheck,28,y,128,24,state->font);Add(window,state->instance,WC_BUTTONW,L"Absolute imaginary",BS_AUTOCHECKBOX,AbsImagCheck,164,y,146,24,state->font);y+=28;
         Add(window,state->instance,WC_BUTTONW,L"Conjugate z",BS_AUTOCHECKBOX,ConjugateCheck,28,y,128,24,state->font);Add(window,state->instance,WC_BUTTONW,L"Swap real / imaginary",BS_AUTOCHECKBOX,SwapCheck,164,y,146,24,state->font);
 
-        y=112; label(352,y+4,110,L"Render mode");HWND render=Add(window,state->instance,WC_COMBOBOXW,L"",CBS_DROPDOWNLIST|WS_TABSTOP,RenderModeCombo,468,y,172,120,state->font);for(const wchar_t* value:{L"Escape-time / Julia",L"Newton convergence"})SendMessageW(render,CB_ADDSTRING,0,reinterpret_cast<LPARAM>(value));y+=38;
-        label(352,y+4,110,L"Initial z");HWND initial=Add(window,state->instance,WC_COMBOBOXW,L"",CBS_DROPDOWNLIST|WS_TABSTOP,InitialModeCombo,468,y,172,150,state->font);for(const wchar_t* value:{L"Zero",L"Fixed value",L"Use c",L"Critical point"})SendMessageW(initial,CB_ADDSTRING,0,reinterpret_cast<LPARAM>(value));y+=38;
+        y=112; label(352,y+4,110,L"Render mode");HWND render=Add(window,state->instance,WC_COMBOBOXW,L"",CBS_DROPDOWNLIST|WS_VSCROLL|WS_TABSTOP,RenderModeCombo,468,y,172,120,state->font);for(const wchar_t* value:{L"Escape-time / Julia",L"Newton convergence"})SendMessageW(render,CB_ADDSTRING,0,reinterpret_cast<LPARAM>(value));y+=38;
+        label(352,y+4,110,L"Initial z");HWND initial=Add(window,state->instance,WC_COMBOBOXW,L"",CBS_DROPDOWNLIST|WS_VSCROLL|WS_TABSTOP,InitialModeCombo,468,y,172,150,state->font);for(const wchar_t* value:{L"Zero",L"Fixed value",L"Use c",L"Critical point"})SendMessageW(initial,CB_ADDSTRING,0,reinterpret_cast<LPARAM>(value));y+=38;
         label(352,y+3,108,L"Fixed z real");edit(468,y,76,InitialReal);label(550,y+3,36,L"imag");edit(588,y,52,InitialImag);y+=36;
         Add(window,state->instance,WC_BUTTONW,L"Julia mode — pixel is z₀ and c is fixed",BS_AUTOCHECKBOX,JuliaCheck,352,y,288,24,state->font);y+=31;
         label(352,y+3,108,L"Fixed c real");edit(468,y,76,JuliaReal);label(550,y+3,36,L"imag");edit(588,y,52,JuliaImag);y+=36;
@@ -341,22 +354,25 @@ LRESULT CALLBACK Procedure(HWND window, UINT message, WPARAM wParam, LPARAM lPar
         label(352,y+3,108,L"Relaxation real");edit(468,y,76,NewtonRelaxReal);label(550,y+3,36,L"imag");edit(588,y,52,NewtonRelaxImag);y+=34;
         label(352,y+3,108,L"Tolerance");edit(468,y,172,NewtonToleranceEdit);
 
-        y=112;label(676,y+4,112,L"Colour method");HWND colouring=Add(window,state->instance,WC_COMBOBOXW,L"",CBS_DROPDOWNLIST|WS_TABSTOP,ColouringCombo,790,y,176,150,state->font);for(const wchar_t* value:{L"Smooth escape",L"Orbit trap",L"Distance estimate",L"Newton basins"})SendMessageW(colouring,CB_ADDSTRING,0,reinterpret_cast<LPARAM>(value));y+=38;
-        label(676,y+4,112,L"Orbit trap");HWND trap=Add(window,state->instance,WC_COMBOBOXW,L"",CBS_DROPDOWNLIST|WS_TABSTOP,TrapCombo,790,y,176,120,state->font);for(const wchar_t* value:{L"Point",L"Cross",L"Circle"})SendMessageW(trap,CB_ADDSTRING,0,reinterpret_cast<LPARAM>(value));y+=38;
+        y=112;label(676,y+4,112,L"Colour method");HWND colouring=Add(window,state->instance,WC_COMBOBOXW,L"",CBS_DROPDOWNLIST|WS_VSCROLL|WS_TABSTOP,ColouringCombo,790,y,176,150,state->font);for(const wchar_t* value:{L"Smooth escape",L"Orbit trap",L"Distance estimate",L"Newton basins"})SendMessageW(colouring,CB_ADDSTRING,0,reinterpret_cast<LPARAM>(value));y+=38;
+        label(676,y+4,112,L"Orbit trap");HWND trap=Add(window,state->instance,WC_COMBOBOXW,L"",CBS_DROPDOWNLIST|WS_VSCROLL|WS_TABSTOP,TrapCombo,790,y,176,120,state->font);for(const wchar_t* value:{L"Point",L"Cross",L"Circle"})SendMessageW(trap,CB_ADDSTRING,0,reinterpret_cast<LPARAM>(value));y+=38;
         label(676,y+3,108,L"Trap point real");edit(790,y,76,TrapReal);label(872,y+3,36,L"imag");edit(910,y,56,TrapImag);y+=34;
         label(676,y+3,108,L"Circle radius");edit(790,y,176,TrapRadiusEdit);y+=34;
-        label(676,y+3,108,L"Glow 0–4");edit(790,y,176,GlowEdit);y+=34;
-        label(676,y+3,108,L"Depth 0–4");edit(790,y,176,DepthEdit);y+=46;
+        label(676,y+3,108,L"Bloom 0–4");edit(790,y,176,GlowEdit);y+=34;
+        label(676,y+3,108,L"Threshold 0–4");edit(790,y,76,BloomThresholdEdit);label(872,y+3,36,L"knee");edit(910,y,56,BloomSoftKneeEdit);y+=34;
+        label(676,y+3,108,L"Bloom radius 0–16");edit(790,y,176,BloomRadiusEdit);y+=34;
+        label(676,y+3,108,L"Edge light 0–4");edit(790,y,176,EdgeLightEdit);y+=34;
+        label(676,y+3,108,L"Depth 0–4");edit(790,y,176,DepthEdit);y+=40;
         Add(window,state->instance,WC_BUTTONW,L"Animate coefficients",BS_AUTOCHECKBOX,AnimateCheck,676,y,200,24,state->font);y+=31;
         label(676,y+3,108,L"Speed 0–8");edit(790,y,176,AnimationSpeedEdit);y+=34;
         label(676,y+3,108,L"Amplitude 0–2");edit(790,y,176,AnimationAmplitudeEdit);y+=42;
         Add(window,state->instance,WC_BUTTONW,L"Randomise bounded equation",BS_PUSHBUTTON,RandomiseButton,676,y,290,30,state->font);y+=42;
-        Add(window,state->instance,WC_STATICW,L"Distance estimation is used for analytic polynomial maps. Unsupported transforms fall back to smooth colouring. Perturbation deep zoom remains limited to compatible quadratic maps.",SS_LEFT,0,676,y,290,76,state->font);
+        Add(window,state->instance,WC_STATICW,L"Distance estimation supports analytic polynomial maps and the exact power-2 Tricorn template. Unsupported transforms fall back to smooth colouring. Perturbation deep zoom remains limited to compatible quadratic maps.",SS_LEFT,0,676,y,290,76,state->font);
 
-        Add(window,state->instance,WC_BUTTONW,L"&Reset Mandelbrot",BS_PUSHBUTTON,ResetButton,14,630,150,32,state->font);
-        Add(window,state->instance,WC_BUTTONW,L"Delete saved",BS_PUSHBUTTON,DeleteSavedButton,174,630,120,32,state->font);
-        Add(window,state->instance,WC_BUTTONW,L"&OK",BS_DEFPUSHBUTTON,OkButton,746,630,106,32,state->font);
-        Add(window,state->instance,WC_BUTTONW,L"&Cancel",BS_PUSHBUTTON,CancelButton,864,630,106,32,state->font);
+        Add(window,state->instance,WC_BUTTONW,L"&Reset Mandelbrot",BS_PUSHBUTTON,ResetButton,14,700,150,32,state->font);
+        Add(window,state->instance,WC_BUTTONW,L"Delete saved",BS_PUSHBUTTON,DeleteSavedButton,174,700,120,32,state->font);
+        Add(window,state->instance,WC_BUTTONW,L"&OK",BS_DEFPUSHBUTTON,OkButton,746,700,106,32,state->font);
+        Add(window,state->instance,WC_BUTTONW,L"&Cancel",BS_PUSHBUTTON,CancelButton,864,700,106,32,state->font);
         PopulateSaved(*state); Populate(window,state->preset->equation);
         state->tooltips.Initialise(window, state->dpi, state->font);
         const auto tip = [&](int id, const wchar_t* text) { state->tooltips.Add(GetDlgItem(window, id), text); };
@@ -374,7 +390,11 @@ LRESULT CALLBACK Procedure(HWND window, UINT message, WPARAM wParam, LPARAM lPar
         tip(NewtonToleranceEdit, L"Convergence threshold. Smaller values sharpen basin boundaries but can require more iterations.");
         tip(ColouringCombo, L"Selects smooth escape, orbit-trap, distance-estimate or Newton-basin colouring.");
         tip(TrapCombo, L"Shape used to measure the nearest orbit approach when orbit-trap colouring is selected.");
-        tip(GlowEdit, L"Post-process glow intensity from 0 to 4. Higher values cost additional GPU time.");
+        tip(GlowEdit, L"Screen-space bloom intensity from 0 to 4. It is independent of mathematical boundary lighting.");
+        tip(BloomThresholdEdit, L"Brightness threshold for bloom extraction. Higher values restrict bloom to brighter pixels.");
+        tip(BloomSoftKneeEdit, L"Soft transition width around the bloom threshold, from 0 to 2.");
+        tip(BloomRadiusEdit, L"Separable bloom radius in render pixels, from 0 to 16. Tiled export automatically expands overlap to match.");
+        tip(EdgeLightEdit, L"Narrow mathematical edge-light strength from 0 to 4. Tricorn power 2 uses its real two-axis Jacobian rather than orbit-trap distance.");
         tip(DepthEdit, L"Depth-shading strength from 0 to 4. This affects appearance, not the fractal equation.");
         tip(AnimateCheck, L"Animates bounded equation coefficients using the speed and amplitude settings below.");
         SendMessageW(window, DM_SETDEFID, OkButton, 0);
@@ -404,18 +424,19 @@ LRESULT CALLBACK Procedure(HWND window, UINT message, WPARAM wParam, LPARAM lPar
         return 0;
     }
     if(message==WM_CLOSE){DestroyWindow(window);return 0;}
-    if(message==WM_DESTROY){if(!state->accepted)state->preset->equation=state->original;RememberDialogPlacement(window,kEquationEditorClass,state->dpi);state->tooltips.Shutdown();state->layout.Shutdown();if(state->font)DeleteObject(state->font);state->font=nullptr;state->done=true;EnableWindow(state->owner,TRUE);SetForegroundWindow(state->owner);return 0;}
+    if(message==WM_DESTROY){if(!state->accepted)state->preset->equation=state->original;RememberDialogPlacement(window,kEquationEditorClass,state->dpi);state->tooltips.Shutdown();state->layout.Shutdown();if(state->font)DeleteObject(state->font);state->font=nullptr;state->done=true;return 0;}
     return DefWindowProcW(window,message,wParam,lParam);
 }
 
 } // namespace
 
 bool EquationEditorDialog::Show(HWND owner, HINSTANCE instance, Preset& preset,
-                                std::vector<EquationPreset>& savedPresets) {
+                                std::vector<EquationPreset>& savedPresets,
+                                std::function<void()> onChanged) {
     WNDCLASSEXW cls{};cls.cbSize=sizeof(cls);cls.lpfnWndProc=Procedure;cls.hInstance=instance;cls.hCursor=LoadCursorW(nullptr,IDC_ARROW);cls.hbrBackground=reinterpret_cast<HBRUSH>(COLOR_WINDOW+1);cls.lpszClassName=kEquationEditorClass;RegisterClassExW(&cls);
-    State state;state.owner=owner;state.instance=instance;state.preset=&preset;state.saved=&savedPresets;state.original=preset.equation;state.dpi=DialogDpi(owner);
-    const RECT dialogRect=ResponsiveDialogRect(owner,1000,720,state.dpi,kEquationEditorClass);
-    HWND window=CreateWindowExW(WS_EX_DLGMODALFRAME|WS_EX_CONTROLPARENT,kEquationEditorClass,L"Advanced Fractal Equation Editor",WS_CAPTION|WS_SYSMENU|WS_THICKFRAME|WS_MAXIMIZEBOX|WS_POPUP|WS_VISIBLE|WS_VSCROLL|WS_HSCROLL,dialogRect.left,dialogRect.top,dialogRect.right-dialogRect.left,dialogRect.bottom-dialogRect.top,owner,nullptr,instance,&state);if(!window)return false;EnableWindow(owner,FALSE);
+    State state;state.owner=owner;state.instance=instance;state.preset=&preset;state.saved=&savedPresets;state.original=preset.equation;state.onChanged=std::move(onChanged);state.dpi=DialogDpi(owner);
+    const RECT dialogRect=ResponsiveDialogRect(owner,1000,790,state.dpi,kEquationEditorClass);
+    HWND window=CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_CONTROLPARENT,kEquationEditorClass,L"Advanced Fractal Equation Editor",WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU|WS_THICKFRAME|WS_MAXIMIZEBOX|WS_VISIBLE|WS_VSCROLL|WS_HSCROLL,dialogRect.left,dialogRect.top,dialogRect.right-dialogRect.left,dialogRect.bottom-dialogRect.top,owner,nullptr,instance,&state);if(!window)return false;
     MSG message{};while(!state.done&&GetMessageW(&message,nullptr,0,0)>0){if(!ProcessModalDialogMessage(window,CancelButton,message,&state.layout)){TranslateMessage(&message);DispatchMessageW(&message);}}
     return state.accepted;
 }

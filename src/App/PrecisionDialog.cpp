@@ -170,7 +170,7 @@ LRESULT CALLBACK Procedure(HWND window, UINT message, WPARAM wParam, LPARAM lPar
 
         Add(*state, WC_STATICW,
             L"Perturbation and split-float deep zoom are limited to compatible quadratic parameter maps. "
-            L"Higher powers, Julia, rational, Newton, conjugate, absolute, trigonometric, exponential and logarithmic operations use native float32/float64 or report an error when fallback is disabled.",
+            L"The exact power-2 Tricorn profile is also supported by perturbation. Higher Multicorn powers, Julia, rational, Newton, transformed conjugate, absolute, trigonometric, exponential and logarithmic operations use direct precision modes or report an error when fallback is disabled.",
             SS_LEFT, 0, 18, y, 612, 64);
         y += 74;
 

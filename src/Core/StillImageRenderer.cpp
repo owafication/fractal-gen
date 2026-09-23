@@ -2,6 +2,7 @@
 
 #include "Core/MandelbrotMath.h"
 #include "Core/DeepZoom.h"
+#include "Core/Precision/HighPrecisionBackend.h"
 
 #include <algorithm>
 #include <array>
@@ -27,17 +28,22 @@ std::array<double, 3> MixColour(const Colour& first, const Colour& second, doubl
     };
 }
 
-std::array<double, 3> SamplePalette(const std::vector<Colour>& palette, double position) {
+std::array<double, 3> SamplePalette(const std::vector<Colour>& palette, double position,
+                                    PaletteInterpolation interpolation) {
     if (palette.empty()) return {1.0, 1.0, 1.0};
     if (palette.size() == 1U) {
         return {palette.front().r, palette.front().g, palette.front().b};
     }
     position -= std::floor(position);
     if (position < 0.0) position += 1.0;
-    const double scaled = position * static_cast<double>(palette.size() - 1U);
-    const auto firstIndex = static_cast<std::size_t>(std::floor(scaled));
-    const std::size_t secondIndex = std::min(firstIndex + 1U, palette.size() - 1U);
-    return MixColour(palette[firstIndex], palette[secondIndex], scaled - std::floor(scaled));
+    const double scaled = position * static_cast<double>(palette.size());
+    const auto firstIndex = static_cast<std::size_t>(std::floor(scaled)) % palette.size();
+    const std::size_t secondIndex = (firstIndex + 1U) % palette.size();
+    double fraction = scaled - std::floor(scaled);
+    if (interpolation == PaletteInterpolation::Smoothstep) {
+        fraction = fraction * fraction * (3.0 - 2.0 * fraction);
+    }
+    return MixColour(palette[firstIndex], palette[secondIndex], fraction);
 }
 
 std::array<double, 3> ApplyAdjustments(std::array<double, 3> colour, const Preset& preset) {
@@ -95,7 +101,9 @@ std::uint32_t MapPreviewCoordinate(std::uint32_t previewCoordinate,
                                                           static_cast<double>(sourceSize - 1U))));
 }
 
-std::array<double, 3> PixelColour(const Preset& preset,
+} // namespace
+
+std::array<double, 3> ColourForEscape(const Preset& preset,
                                   const std::vector<Colour>& palette,
                                   const EscapeResult& escape,
                                   int maximumIterations) {
@@ -120,16 +128,29 @@ std::array<double, 3> PixelColour(const Preset& preset,
                escape.distanceEstimate > 0.0) {
         position = -std::log(std::max(escape.distanceEstimate, 1.0e-10)) * 0.22;
     }
+    position *= preset.paletteFrequency;
+    if (equation.stripeAverageEnabled && equation.stripeStrength > 0.0) {
+        position += (escape.stripeAverage - 0.5) * equation.stripeStrength;
+    }
     position += preset.colourOffset;
+    double phase = position - std::floor(position);
+    if (phase < 0.0) phase += 1.0;
+    phase = std::pow(std::max(phase, 1.0e-12), preset.paletteGamma);
 
-    std::array<double, 3> colour = SamplePalette(palette, position);
-    if (equation.glowStrength > 0.0) {
-        const double glow =
-            std::exp(-std::min(escape.orbitTrapDistance, 10.0) * 12.0) *
-            equation.glowStrength * 0.20;
-        colour[0] = ClampUnit(colour[0] + glow);
-        colour[1] = ClampUnit(colour[1] + glow);
-        colour[2] = ClampUnit(colour[2] + glow);
+    std::array<double, 3> colour = SamplePalette(palette, phase, preset.paletteInterpolation);
+    if (equation.edgeLightingStrength > 0.0) {
+        double edgeFeature = 0.0;
+        if (equation.colouringMethod == ColouringMethod::DistanceEstimation &&
+            escape.distanceEstimate > 0.0) {
+            edgeFeature = std::exp(-escape.distanceEstimate * 80.0);
+        } else if (equation.colouringMethod == ColouringMethod::OrbitTrap &&
+                   std::isfinite(escape.orbitTrapDistance)) {
+            edgeFeature = std::exp(-std::min(escape.orbitTrapDistance, 10.0) * 18.0);
+        }
+        const double edge = edgeFeature * equation.edgeLightingStrength * 0.20;
+        colour[0] = ClampUnit(colour[0] + edge);
+        colour[1] = ClampUnit(colour[1] + edge);
+        colour[2] = ClampUnit(colour[2] + edge);
     }
     if (equation.depthStrength > 0.0 && escape.escaped) {
         const double depth = std::clamp(
@@ -144,7 +165,43 @@ std::array<double, 3> PixelColour(const Preset& preset,
     return ApplyAdjustments(colour, preset);
 }
 
-} // namespace
+ComplexPlanePoint MapStillRenderSample(const CameraState& camera,
+                                        double rotationDegrees,
+                                        std::uint32_t fullWidth,
+                                        std::uint32_t fullHeight,
+                                        double pixelX,
+                                        double pixelY) noexcept {
+    ComplexPlanePoint point{CameraCentreX(camera), CameraCentreY(camera)};
+    if (fullWidth == 0U || fullHeight == 0U || !(camera.scale > 0.0) ||
+        !std::isfinite(camera.scale) || !std::isfinite(rotationDegrees)) {
+        return point;
+    }
+    const long double aspect = static_cast<long double>(fullWidth) /
+                               static_cast<long double>(fullHeight);
+    const long double nx = static_cast<long double>(pixelX) * 2.0L /
+                               static_cast<long double>(fullWidth) - 1.0L;
+    const long double ny = 1.0L - static_cast<long double>(pixelY) * 2.0L /
+                                      static_cast<long double>(fullHeight);
+    const long double localX = nx * aspect * static_cast<long double>(camera.scale);
+    const long double localY = ny * static_cast<long double>(camera.scale);
+    constexpr long double pi = 3.141592653589793238462643383279502884L;
+    const long double radians = static_cast<long double>(rotationDegrees) * pi / 180.0L;
+    const long double cosine = std::cos(radians);
+    const long double sine = std::sin(radians);
+    const long double rotatedX = localX * cosine - localY * sine;
+    const long double rotatedY = localX * sine + localY * cosine;
+    point.real += static_cast<double>(rotatedX);
+    point.imaginary += static_cast<double>(rotatedY);
+    return point;
+}
+
+std::uint32_t StillRenderTileOverlapPixels(const Preset& preset) noexcept {
+    const int bloomRadius = preset.equation.glowStrength > 0.0
+        ? std::clamp(preset.equation.bloomRadius, 0, 16)
+        : 0;
+    const int reconstructionRadius = preset.antiAliasingLevel > 1 ? 1 : 0;
+    return static_cast<std::uint32_t>(bloomRadius + reconstructionRadius);
+}
 
 StillRenderQuality ResolveStillRenderQuality(const StillRenderRequest& request) noexcept {
     StillRenderQuality quality;
@@ -183,7 +240,8 @@ CameraState CameraForStillRenderTile(const CameraState& fullCamera,
                                      std::uint32_t tileX,
                                      std::uint32_t tileY,
                                      std::uint32_t tileWidth,
-                                     std::uint32_t tileHeight) noexcept {
+                                     std::uint32_t tileHeight,
+                                     double rotationDegrees) noexcept {
     CameraState tileCamera = fullCamera;
     if (fullWidth == 0U || fullHeight == 0U || tileWidth == 0U || tileHeight == 0U ||
         tileX >= fullWidth || tileY >= fullHeight || !(fullCamera.scale > 0.0) ||
@@ -203,16 +261,78 @@ CameraState CameraForStillRenderTile(const CameraState& fullCamera,
     // Output rows are top-down, while the fractal coordinate system has +Y at the top.
     const long double verticalNormalised = 1.0L - tileCentreY * 2.0L / fullHeightValue;
     const long double fullAspect = fullWidthValue / fullHeightValue;
-    const double deltaX = static_cast<double>(horizontalNormalised * fullAspect *
-                                               static_cast<long double>(fullCamera.scale));
-    const double deltaY = static_cast<double>(verticalNormalised *
-                                               static_cast<long double>(fullCamera.scale));
+    const long double localX = horizontalNormalised * fullAspect *
+                               static_cast<long double>(fullCamera.scale);
+    const long double localY = verticalNormalised *
+                               static_cast<long double>(fullCamera.scale);
+    constexpr long double pi = 3.141592653589793238462643383279502884L;
+    const long double radians = static_cast<long double>(rotationDegrees) * pi / 180.0L;
+    const long double cosine = std::cos(radians);
+    const long double sine = std::sin(radians);
+    const double deltaX = static_cast<double>(localX * cosine - localY * sine);
+    const double deltaY = static_cast<double>(localX * sine + localY * cosine);
     OffsetCamera(tileCamera, deltaX, deltaY);
     tileCamera.scale = static_cast<double>(static_cast<long double>(fullCamera.scale) *
                                            static_cast<long double>(tileHeight) /
                                            fullHeightValue);
     NormaliseCamera(tileCamera);
     return tileCamera;
+}
+
+bool BuildExactStillRenderSubpixelSample(const ExactCamera& camera,
+                                         double rotationDegrees,
+                                         std::uint32_t fullWidth,
+                                         std::uint32_t fullHeight,
+                                         std::uint32_t pixelX,
+                                         std::uint32_t pixelY,
+                                         std::uint32_t samplesPerAxis,
+                                         std::uint32_t sampleX,
+                                         std::uint32_t sampleY,
+                                         ExactStillRenderSample& result,
+                                         std::string& error) {
+    result = {};
+    error.clear();
+    if (fullWidth == 0U || fullHeight == 0U || pixelX >= fullWidth || pixelY >= fullHeight) {
+        error = "Exact still sample dimensions or pixel coordinates are invalid.";
+        return false;
+    }
+    if (!std::isfinite(rotationDegrees)) {
+        error = "Exact still sample rotation is not finite.";
+        return false;
+    }
+    if (samplesPerAxis == 0U || samplesPerAxis > 4U || sampleX >= samplesPerAxis ||
+        sampleY >= samplesPerAxis ||
+        fullHeight > (std::numeric_limits<std::uint32_t>::max)() / samplesPerAxis) {
+        error = "Exact still subpixel sample grid or dimensions are invalid.";
+        return false;
+    }
+    const std::int64_t width = static_cast<std::int64_t>(fullWidth);
+    const std::int64_t height = static_cast<std::int64_t>(fullHeight);
+    const std::int64_t samples = static_cast<std::int64_t>(samplesPerAxis);
+    const std::int64_t subpixelX = 2LL * static_cast<std::int64_t>(sampleX) + 1LL;
+    const std::int64_t subpixelY = 2LL * static_cast<std::int64_t>(sampleY) + 1LL;
+    result.camera = camera;
+    result.horizontalHalfHeightFactor = {
+        samples * (2LL * static_cast<std::int64_t>(pixelX) - width) + subpixelX,
+        samplesPerAxis * fullHeight};
+    result.verticalHalfHeightFactor = {
+        samples * (height - 2LL * static_cast<std::int64_t>(pixelY)) - subpixelY,
+        samplesPerAxis * fullHeight};
+    result.rotationDegrees = rotationDegrees;
+    result.requiresRotationAdapter = rotationDegrees != 0.0;
+    return true;
+}
+
+bool BuildExactStillRenderPixelSample(const ExactCamera& camera,
+                                      double rotationDegrees,
+                                      std::uint32_t fullWidth,
+                                      std::uint32_t fullHeight,
+                                      std::uint32_t pixelX,
+                                      std::uint32_t pixelY,
+                                      ExactStillRenderSample& result,
+                                      std::string& error) {
+    return BuildExactStillRenderSubpixelSample(camera, rotationDegrees, fullWidth, fullHeight,
+                                                pixelX, pixelY, 1U, 0U, 0U, result, error);
 }
 
 bool RenderStillImageTiled(const StillRenderRequest& request,
@@ -280,8 +400,6 @@ bool RenderStillImageTiled(const StillRenderRequest& request,
     const int antiAliasing = quality.antiAliasingLevel;
     result.statistics.maximumIterations = maximumIterations;
     result.statistics.antiAliasingLevel = antiAliasing;
-    const double aspect = static_cast<double>(request.width) /
-                          static_cast<double>(request.height);
     std::uint32_t nextPreviewY = 0U;
     std::uint32_t nextPreviewSourceY = result.preview.height > 0U
         ? MapPreviewCoordinate(0U, result.preview.height, request.height)
@@ -293,18 +411,6 @@ bool RenderStillImageTiled(const StillRenderRequest& request,
             error = "Still render cancelled.";
             return false;
         }
-        std::array<double, 4> imaginarySamples{};
-        for (int sampleY = 0; sampleY < antiAliasing; ++sampleY) {
-            const double vertical =
-                (static_cast<double>(y) +
-                 (static_cast<double>(sampleY) + 0.5) /
-                     static_cast<double>(antiAliasing)) /
-                static_cast<double>(request.height);
-            imaginarySamples[static_cast<std::size_t>(sampleY)] =
-                CameraCentreY(preset.camera) +
-                (vertical * 2.0 - 1.0) * preset.camera.scale;
-        }
-
         for (std::uint32_t tileStart = 0U; tileStart < request.width;
              tileStart += tileWidth) {
             if (cancellationCallback && cancellationCallback()) {
@@ -322,20 +428,22 @@ bool RenderStillImageTiled(const StillRenderRequest& request,
                 std::array<double, 3> accumulated{};
                 for (int sampleY = 0; sampleY < antiAliasing; ++sampleY) {
                     for (int sampleX = 0; sampleX < antiAliasing; ++sampleX) {
-                        const double horizontal =
-                            (static_cast<double>(x) +
-                             (static_cast<double>(sampleX) + 0.5) /
-                                 static_cast<double>(antiAliasing)) /
-                            static_cast<double>(request.width);
-                        const double real = CameraCentreX(preset.camera) +
-                            (horizontal * 2.0 - 1.0) * preset.camera.scale * aspect;
+                        const double samplePixelX = static_cast<double>(x) +
+                            (static_cast<double>(sampleX) + 0.5) /
+                                static_cast<double>(antiAliasing);
+                        const double samplePixelY = static_cast<double>(y) +
+                            (static_cast<double>(sampleY) + 0.5) /
+                                static_cast<double>(antiAliasing);
+                        const ComplexPlanePoint point = MapStillRenderSample(
+                            preset.camera, preset.rotationDegrees, request.width, request.height,
+                            samplePixelX, samplePixelY);
                         const EscapeResult escape = CalculateEscape(
-                            real,
-                            imaginarySamples[static_cast<std::size_t>(sampleY)],
+                            point.real,
+                            point.imaginary,
                             maximumIterations,
                             preset.equation,
                             request.timeSeconds);
-                        const auto sampleColour = PixelColour(
+                        const auto sampleColour = ColourForEscape(
                             preset, palette, escape, maximumIterations);
                         accumulated[0] += sampleColour[0];
                         accumulated[1] += sampleColour[1];
@@ -370,6 +478,110 @@ bool RenderStillImageTiled(const StillRenderRequest& request,
         if (!rowWriter(y, row, writerError)) {
             error = writerError.empty() ? "The still-render output row could not be written."
                                         : writerError;
+            return false;
+        }
+        result.statistics.renderedPixels += request.width;
+        if (progressCallback) progressCallback({y + 1U, request.height});
+    }
+    return true;
+}
+
+bool RenderExactDirectStillImage(const ExactDirectStillRenderRequest& request,
+                                 const StillRenderRowWriter& rowWriter,
+                                 const StillRenderProgressCallback& progressCallback,
+                                 const StillRenderCancellationCallback& cancellationCallback,
+                                 StillRenderResult& result,
+                                 std::string& error) {
+    result = {};
+    error.clear();
+    if (request.width == 0U || request.height == 0U || !rowWriter) {
+        error = "Exact direct still rendering requires dimensions and a row writer.";
+        return false;
+    }
+    if (request.preset.rotationDegrees != 0.0) {
+        error = "Exact direct still rendering does not support rotation yet.";
+        return false;
+    }
+    if (request.preset.equation.animateCoefficients) {
+        error = "Exact direct still rendering does not support animated equation coefficients.";
+        return false;
+    }
+    const int antiAliasing = request.preset.antiAliasingLevel;
+    if (antiAliasing < 1 || antiAliasing > 4) {
+        error = "Exact direct still rendering requires an anti-aliasing level between 1 and 4.";
+        return false;
+    }
+    if (request.maximumIterations < 32 || request.maximumIterations > 4096) {
+        error = "Exact direct still rendering iterations must be between 32 and 4096.";
+        return false;
+    }
+    if (request.precisionBits != 512 && request.precisionBits != 2048 &&
+        request.precisionBits != 8192 && request.precisionBits != kMaximumDirectHighPrecisionBits) {
+        error = "Exact direct still rendering requires a planner-selected 512-bit, 2048-bit, 8192-bit, or 16384-bit CPU tier.";
+        return false;
+    }
+    constexpr std::size_t kMaximumExactDirectRowBytes = 64U * 1024U * 1024U;
+    if (request.width > kMaximumExactDirectRowBytes / sizeof(std::uint32_t)) {
+        error = "Exact direct still rendering refuses output rows larger than the 64 MiB working-memory bound.";
+        return false;
+    }
+    const std::uint32_t fullWidth = request.fullWidth == 0U ? request.width : request.fullWidth;
+    const std::uint32_t fullHeight = request.fullHeight == 0U ? request.height : request.fullHeight;
+    if (fullWidth == 0U || fullHeight == 0U ||
+        static_cast<std::uint64_t>(request.tileOriginX) + request.width > fullWidth ||
+        static_cast<std::uint64_t>(request.tileOriginY) + request.height > fullHeight) {
+        error = "Exact direct still tile origin or full-frame dimensions are invalid.";
+        return false;
+    }
+    const auto palette = ActivePalette(request.preset);
+    std::vector<std::uint32_t> row(request.width);
+    result.statistics.tileWidth = request.width;
+    result.statistics.tileHeight = 1U;
+    result.statistics.peakWorkingPixels = row.size();
+    result.statistics.maximumIterations = request.maximumIterations;
+    result.statistics.antiAliasingLevel = antiAliasing;
+    for (std::uint32_t y = 0U; y < request.height; ++y) {
+        if (cancellationCallback && cancellationCallback()) {
+            error = "Exact direct still rendering was cancelled.";
+            return false;
+        }
+        for (std::uint32_t x = 0U; x < request.width; ++x) {
+            std::array<double, 3> accumulated{};
+            for (int sampleY = 0; sampleY < antiAliasing; ++sampleY) {
+                for (int sampleX = 0; sampleX < antiAliasing; ++sampleX) {
+                    ExactStillRenderSample sample;
+                    if (!BuildExactStillRenderSubpixelSample(
+                            request.camera, 0.0, fullWidth, fullHeight,
+                            request.tileOriginX + x, request.tileOriginY + y,
+                            static_cast<std::uint32_t>(antiAliasing),
+                            static_cast<std::uint32_t>(sampleX),
+                            static_cast<std::uint32_t>(sampleY), sample, error)) {
+                        return false;
+                    }
+                    HighPrecisionEscapeResult escape;
+                    if (!EvaluateIndependentHighPrecisionSample(sample, request.preset.equation,
+                                                                request.maximumIterations,
+                                                                cancellationCallback, escape, error,
+                                                                request.precisionBits)) {
+                        return false;
+                    }
+                    const auto colour = ColourForEscape(request.preset, palette,
+                                                        ToEscapeResult(escape),
+                                                        request.maximumIterations);
+                    accumulated[0] += colour[0];
+                    accumulated[1] += colour[1];
+                    accumulated[2] += colour[2];
+                }
+            }
+            const double sampleCount = static_cast<double>(antiAliasing * antiAliasing);
+            accumulated[0] /= sampleCount;
+            accumulated[1] /= sampleCount;
+            accumulated[2] /= sampleCount;
+            row[x] = PackPixel(accumulated);
+        }
+        std::string writerError;
+        if (!rowWriter(y, row, writerError)) {
+            error = writerError.empty() ? "The exact direct output row could not be written." : writerError;
             return false;
         }
         result.statistics.renderedPixels += request.width;

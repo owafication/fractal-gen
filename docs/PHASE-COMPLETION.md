@@ -1,3 +1,5 @@
+> **Historical record:** This file records earlier phase claims. Current phase order, evidence gates and status are owned by `project_docs/IMPLEMENTATION_PLAN.md` and `project_docs/VALIDATION_AND_EVIDENCE.md`.
+
 # Phase Completion Record
 
 ## Phase 1 — Rendering prototype
@@ -154,3 +156,88 @@ Completed:
 - Removed redundant preset save/rename and preview-transfer actions from compact menus.
 - Made preview and desktop animation opt-in on every app launch.
 - Changed custom Automatic Journey scripts to exact ordered transition/hold routes.
+
+
+## Phase 20 — Tricorn colour texture foundation (1.12.0)
+
+- Added named Tricorn/Mandelbar and Multicorn power-3/power-4 equation templates.
+- Added persisted palette frequency, gamma and linear/smooth mapping controls.
+- Added optional stripe-average orbit colouring with density, phase, strength and start-iteration controls.
+- Applied the new colour contract to CPU still rendering, OpenGL and Direct3D 11 inputs.
+- Added the Cyan Fire Ring palette and Tricorn Cyan Fire Ring scene.
+- Added `docs/FRACTAL-STYLE-BUILD-PLAN.md` for the remaining conjugate distance, deep perturbation, post-processing/rotation and Fractal Scout phases.
+- Portable GCC/Clang core verification passes; native Windows UI and shader runtime comparison remain external.
+
+
+## Phase 21 — Tricorn Jacobian distance and edge lighting (1.12.1)
+
+Implemented the second fractal-style build-plan phase:
+
+- exact power-2 Tricorn real two-axis Jacobian tracking;
+- largest-singular-value distance estimation;
+- strict support gating for unsupported conjugate formulas;
+- independent mathematical edge lighting and screen-space bloom;
+- one-time migration of older glow settings to preserve appearance;
+- CPU, OpenGL and Direct3D 11 renderer contract updates;
+- finite-difference and persistence regression tests.
+
+Deep Tricorn perturbation remains the next planned phase.
+
+
+## Phase 22 — Deep Tricorn perturbation (1.12.2)
+
+- Added exact Tricorn perturbation profile selection.
+- Added conjugate double and arbitrary-precision reference orbit generation.
+- Added OpenGL and Direct3D 11 conjugate perturbation recurrence.
+- Added guarded split-float fallback and deterministic CPU reference refresh.
+- Added progressively deeper direct-versus-perturbation regression coverage.
+
+Next: Phase 4 post-processing, tile-overlap calculation, and camera rotation.
+
+## Phase 23 — Post-processing and camera rotation (1.12.3)
+
+- Added persisted bloom threshold, soft knee and radius controls with compatibility defaults.
+- Replaced the fixed GPU bloom kernel with bounded horizontal/vertical separable passes in OpenGL and Direct3D 11.
+- Made GPU high-resolution tile overlap follow the active bloom radius and anti-alias reconstruction allowance.
+- Added persisted camera rotation across preview, desktop, CPU still/static fallback, GPU tiles, drag pan and wheel-zoom anchoring.
+- Added global-pixel mapping, rotated tile-centre, overlap, persistence and rotated interaction regression fixtures.
+
+Next: Phase 5 Fractal Scout candidate discovery.
+
+## Phase 24 — Fractal Scout (1.12.4)
+
+- Added a deterministic bounded candidate search around the current preview camera.
+- Added boundary-mix, iteration-variance, edge-density, detail and symmetry scoring.
+- Added CPU-rendered ranked thumbnails with Fast, Balanced and Detailed resource budgets.
+- Added cancellable background search, selected-candidate refinement, temporary preview application and explicit Save as New handoff.
+- Added deterministic, cancellation, memory-bound and thumbnail-completeness regression coverage.
+
+
+## Phase 25 — Targeted multi-scale Fractal Scout (1.12.5)
+
+- Added Balanced, Boundary, Filaments and Symmetry Scout scoring goals.
+- Added deterministic logarithmic depth bands around each search position.
+- Added position-and-scale near-duplicate suppression with bounded deterministic relaxation.
+- Added the Search target selector and diversity reporting to the Scout dialog.
+- Added score-profile, depth-band, suppression, determinism and limit regression coverage.
+
+
+## Phase 26 — Windows Fractal Scout build correction (1.12.6)
+
+- Added the missing direct `Core/DeepZoom.h` dependency to the Win32 Fractal Scout dialog.
+- Corrected the MSVC undeclared `CameraCentreX` / `CameraCentreY` failure and its cascading stream ambiguity.
+- Added a source regression check for the Windows-only translation-unit dependency.
+- Recorded later save-path, desktop-mode, journey, dropdown, window-behaviour, and live-palette requests without implementing them.
+
+## 1.13.0 desktop/output UX
+
+Implemented the explicit desktop-mode Apply flow, safe default launch mode, shared image output directory/format/compression settings, Journey Settings access, scrollable Equation Editor dropdowns, independent Settings/Equation/Palette windows, and live Palette Editor preview updates.
+
+
+## 1.13.1 Windows Journey Settings build correction
+
+Implemented:
+
+- Public read-only journey-script validation contract.
+- Journey Settings no longer calls the private animation parser.
+- MSVC C2248 regression source check and core validation fixtures.

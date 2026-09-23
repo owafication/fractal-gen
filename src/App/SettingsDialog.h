@@ -7,6 +7,7 @@
 #endif
 
 #include <vector>
+#include <functional>
 
 namespace mw {
 
@@ -14,7 +15,7 @@ class SettingsDialog {
 public:
 #ifdef _WIN32
     static bool Show(HWND owner, HINSTANCE instance, AppSettings& settings, Preset& preset,
-                     const std::vector<Preset>& presets);
+                     const std::vector<Preset>& presets, std::function<void()> onChanged = {});
 #endif
 };
 

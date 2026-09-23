@@ -19,8 +19,10 @@ public:
 
     void SetPreset(const Preset& preset, bool reducedMotion);
     void SetManualCamera(const CameraState& camera);
-    void Pan(double normalisedDeltaX, double normalisedDeltaY, double aspectRatio);
-    void ZoomAt(double normalisedX, double normalisedY, double wheelSteps, double aspectRatio);
+    void Pan(double normalisedDeltaX, double normalisedDeltaY, double aspectRatio,
+             double rotationDegrees = 0.0);
+    void ZoomAt(double normalisedX, double normalisedY, double wheelSteps, double aspectRatio,
+                double rotationDegrees = 0.0);
     void Reset();
     void SetColourCyclingEnabled(bool enabled) noexcept { colourCyclingEnabled_ = enabled; }
     [[nodiscard]] bool ColourCyclingEnabled() const noexcept { return colourCyclingEnabled_; }
@@ -29,6 +31,7 @@ public:
     AnimationFrame Update(double deltaSeconds);
     [[nodiscard]] const CameraState& Camera() const noexcept { return current_.camera; }
     [[nodiscard]] std::size_t JourneyTargetCount() const noexcept { return journey_.size(); }
+    [[nodiscard]] static bool HasValidJourneyScriptTargets(const std::string& script);
 
 private:
     struct JourneyPoint {

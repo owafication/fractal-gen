@@ -1,4 +1,5 @@
 #include "Core/Models.h"
+#include "Core/Precision/ExactCameraAdapter.h"
 
 #include <array>
 #include <limits>
@@ -90,7 +91,6 @@ std::string ToString(MonitorMode value) {
     switch (value) {
     case MonitorMode::Mirror: return "mirror";
     case MonitorMode::Span: return "span";
-    case MonitorMode::Independent: return "independent";
     }
     return "mirror";
 }
@@ -113,6 +113,26 @@ std::string ToString(StaticSlideshowOrder value) {
     case StaticSlideshowOrder::Shuffle: return "shuffle";
     }
     return "sequential";
+}
+
+std::string ToString(SavedImageFormat value) {
+    switch (value) {
+    case SavedImageFormat::Png: return "png";
+    case SavedImageFormat::Jpeg: return "jpeg";
+    case SavedImageFormat::Tiff: return "tiff";
+    case SavedImageFormat::Bmp: return "bmp";
+    }
+    return "png";
+}
+
+std::string ToString(DesktopMode value) {
+    switch (value) {
+    case DesktopMode::None: return "none";
+    case DesktopMode::StaticImage: return "static-image";
+    case DesktopMode::Slideshow: return "slideshow";
+    case DesktopMode::Video: return "video";
+    }
+    return "none";
 }
 
 std::string ToString(EquationUnaryTransform value) {
@@ -157,6 +177,14 @@ std::string ToString(OrbitTrapType value) {
     case OrbitTrapType::Circle: return "circle";
     }
     return "point";
+}
+
+std::string ToString(PaletteInterpolation value) {
+    switch (value) {
+    case PaletteInterpolation::Linear: return "linear";
+    case PaletteInterpolation::Smoothstep: return "smoothstep";
+    }
+    return "linear";
 }
 
 std::optional<AnimationMode> AnimationModeFromString(const std::string& value) {
@@ -204,7 +232,9 @@ std::optional<PerformanceProfile> PerformanceProfileFromString(const std::string
 std::optional<MonitorMode> MonitorModeFromString(const std::string& value) {
     if (value == "mirror") return MonitorMode::Mirror;
     if (value == "span") return MonitorMode::Span;
-    if (value == "independent") return MonitorMode::Independent;
+    // Schema 12 removed inert per-monitor preset assignment. Preserve old
+    // settings safely by treating the former independent layout as mirror.
+    if (value == "independent") return MonitorMode::Mirror;
     return std::nullopt;
 }
 
@@ -221,6 +251,25 @@ std::optional<PrecisionMode> PrecisionModeFromString(const std::string& value) {
 std::optional<StaticSlideshowOrder> StaticSlideshowOrderFromString(const std::string& value) {
     if (value == "sequential") return StaticSlideshowOrder::Sequential;
     if (value == "shuffle") return StaticSlideshowOrder::Shuffle;
+    return std::nullopt;
+}
+
+std::optional<SavedImageFormat> SavedImageFormatFromString(const std::string& value) {
+    if (value == "png") return SavedImageFormat::Png;
+    if (value == "jpeg" || value == "jpg") return SavedImageFormat::Jpeg;
+    if (value == "tiff" || value == "tif") return SavedImageFormat::Tiff;
+    if (value == "bmp") return SavedImageFormat::Bmp;
+    return std::nullopt;
+}
+
+std::optional<DesktopMode> DesktopModeFromString(const std::string& value) {
+    if (value == "none") return DesktopMode::None;
+    if (value == "static-image") return DesktopMode::StaticImage;
+    if (value == "slideshow") return DesktopMode::Slideshow;
+    if (value == "video") return DesktopMode::Video;
+    // Schema 10 and earlier offered continuously rendered desktop modes.
+    // They migrate fail-closed to no desktop background.
+    if (value == "live-image" || value == "journey") return DesktopMode::None;
     return std::nullopt;
 }
 
@@ -259,6 +308,12 @@ std::optional<OrbitTrapType> OrbitTrapTypeFromString(const std::string& value) {
     if (value == "point") return OrbitTrapType::Point;
     if (value == "cross") return OrbitTrapType::Cross;
     if (value == "circle") return OrbitTrapType::Circle;
+    return std::nullopt;
+}
+
+std::optional<PaletteInterpolation> PaletteInterpolationFromString(const std::string& value) {
+    if (value == "linear") return PaletteInterpolation::Linear;
+    if (value == "smoothstep") return PaletteInterpolation::Smoothstep;
     return std::nullopt;
 }
 
@@ -303,7 +358,9 @@ std::vector<std::string> EquationExampleNames() {
         "Cubic Multibrot",
         "Degree-5 Multibrot",
         "Burning Ship",
-        "Conjugate Tricorn",
+        "Tricorn / Mandelbar (power 2)",
+        "Multicorn (power 3)",
+        "Multicorn (power 4)",
         "Linear z + 1.2c",
         "Rational z^3 + 0.25/z + c + 1.2",
         "Julia -0.8 + 0.156i",
@@ -364,183 +421,202 @@ EquationSettings EquationExample(std::size_t index) {
         break;
     case 4:
         equation.conjugate = true;
+        equation.bailoutRadius = 8.0;
         break;
     case 5:
+        equation.conjugate = true;
+        equation.power = 3;
+        equation.initialZMode = InitialZMode::CriticalPoint;
+        equation.bailoutRadius = 8.0;
+        break;
+    case 6:
+        equation.conjugate = true;
+        equation.power = 4;
+        equation.initialZMode = InitialZMode::CriticalPoint;
+        equation.bailoutRadius = 8.0;
+        break;
+    case 7:
         equation.quadratic = {0.0, 0.0};
         equation.linear = {1.0, 0.0};
         equation.parameter = {1.2, 0.0};
         break;
-    case 6:
+    case 8:
         equation.power = 3;
         equation.reciprocalPower = 1;
         equation.reciprocalCoefficient = {0.25, 0.0};
         equation.constant = {1.2, 0.0};
         equation.initialZMode = InitialZMode::CriticalPoint;
         break;
-    case 7:
+    case 9:
         equation.juliaMode = true;
         equation.juliaParameter = {-0.8, 0.156};
         break;
-    case 8:
+    case 10:
         equation.renderMode = FractalRenderMode::Newton;
         equation.newtonMode = true;
         equation.newtonDegree = 3;
         equation.newtonTarget = {1.0, 0.0};
         equation.colouringMethod = ColouringMethod::NewtonBasins;
         break;
-    case 9:
+    case 11:
         equation.quadratic = {0.85, 0.0};
         equation.power = 1;
         equation.unaryTransform = EquationUnaryTransform::Sin;
         break;
-    case 10:
+    case 12:
         equation.quadratic = {0.85, 0.0};
         equation.power = 1;
         equation.unaryTransform = EquationUnaryTransform::Cos;
         break;
-    case 11:
+    case 13:
         equation.quadratic = {0.35, 0.0};
         equation.power = 1;
         equation.unaryTransform = EquationUnaryTransform::Exp;
         equation.bailoutRadius = 8.0;
         break;
-    case 12:
+    case 14:
         equation.colouringMethod = ColouringMethod::OrbitTrap;
         equation.orbitTrap = OrbitTrapType::Circle;
         equation.orbitTrapRadius = 0.35;
         equation.glowStrength = 1.4;
+        equation.edgeLightingStrength = 1.4;
         equation.depthStrength = 0.4;
         break;
-    case 13:
+    case 15:
         equation.colouringMethod = ColouringMethod::DistanceEstimation;
         equation.glowStrength = 0.65;
+        equation.edgeLightingStrength = 0.65;
         equation.depthStrength = 1.25;
         break;
-    case 14:
+    case 16:
         equation.parameter = {1.2, 0.0};
         break;
-    case 15:
+    case 17:
         equation.constant = {0.5, 0.0};
         break;
-    case 16:
+    case 18:
         equation.quadratic = {1.2, 0.0};
         break;
-    case 17:
+    case 19:
         equation.linear = {0.5, 0.0};
         break;
-    case 18:
+    case 20:
         equation.quadratic = {0.0, 0.0};
         equation.linear = {1.0, 0.0};
         equation.parameterPower = 2;
         break;
-    case 19:
+    case 21:
         equation.absoluteReal = true;
         equation.absoluteImaginary = true;
         break;
-    case 20:
+    case 22:
         equation.parameter = {-1.0, 0.0};
         break;
-    case 21:
+    case 23:
         equation.power = 4;
         equation.initialZMode = InitialZMode::CriticalPoint;
         break;
-    case 22:
+    case 24:
         equation.power = 6;
         equation.initialZMode = InitialZMode::CriticalPoint;
         break;
-    case 23:
+    case 25:
         equation.power = 8;
         equation.initialZMode = InitialZMode::CriticalPoint;
         break;
-    case 24:
+    case 26:
         equation.juliaMode = true;
         equation.juliaParameter = {-0.835, -0.2321};
         break;
-    case 25:
+    case 27:
         equation.juliaMode = true;
         equation.juliaParameter = {-0.123, 0.745};
         break;
-    case 26:
+    case 28:
         equation.juliaMode = true;
         equation.juliaParameter = {0.0, 1.0};
         break;
-    case 27:
+    case 29:
         equation.juliaMode = true;
         equation.juliaParameter = {-0.391, -0.587};
         break;
-    case 28:
-    case 29:
     case 30:
+    case 31:
+    case 32:
         equation.renderMode = FractalRenderMode::Newton;
         equation.newtonMode = true;
-        equation.newtonDegree = index == 28 ? 4 : (index == 29 ? 5 : 7);
+        equation.newtonDegree = index == 30 ? 4 : (index == 31 ? 5 : 7);
         equation.newtonTarget = {1.0, 0.0};
         equation.colouringMethod = ColouringMethod::NewtonBasins;
         equation.glowStrength = 0.55;
+        equation.edgeLightingStrength = 0.55;
         break;
-    case 31:
+    case 33:
         equation.quadratic = {0.58, 0.0};
         equation.power = 1;
         equation.unaryTransform = EquationUnaryTransform::Log;
         equation.bailoutRadius = 6.0;
         break;
-    case 32:
+    case 34:
         equation.reciprocalPower = 1;
         equation.reciprocalCoefficient = {0.2, 0.0};
         equation.initialZMode = InitialZMode::Fixed;
         equation.initialZ = {0.1, 0.0};
         break;
-    case 33:
+    case 35:
         equation.power = 3;
         equation.reciprocalPower = 2;
         equation.reciprocalCoefficient = {0.15, 0.0};
         equation.initialZMode = InitialZMode::Fixed;
         equation.initialZ = {0.2, 0.0};
         break;
-    case 34:
+    case 36:
         equation.colouringMethod = ColouringMethod::OrbitTrap;
         equation.orbitTrap = OrbitTrapType::Cross;
         equation.glowStrength = 1.15;
+        equation.edgeLightingStrength = 1.15;
         equation.depthStrength = 0.35;
         break;
-    case 35:
+    case 37:
         equation.colouringMethod = ColouringMethod::OrbitTrap;
         equation.orbitTrap = OrbitTrapType::Point;
         equation.orbitTrapPoint = {-0.25, 0.0};
         equation.glowStrength = 1.0;
+        equation.edgeLightingStrength = 1.0;
         break;
-    case 36:
+    case 38:
         equation.animateCoefficients = true;
         equation.coefficientAnimationSpeed = 0.16;
         equation.coefficientAnimationAmplitude = 0.12;
         equation.glowStrength = 0.5;
+        equation.edgeLightingStrength = 0.5;
         break;
-    case 37:
+    case 39:
         equation.iterationTerm = {0.0015, -0.0008};
         equation.bailoutRadius = 8.0;
         break;
-    case 38:
+    case 40:
         equation.quadratic = {0.0, 0.0};
         equation.linear = {1.0, 0.0};
         equation.parameterPower = 3;
         break;
-    case 39:
+    case 41:
         equation.parameter = {1.0, 0.25};
         break;
-    case 40:
+    case 42:
         equation.quadratic = {0.8, 0.2};
         break;
-    case 41:
+    case 43:
         equation.linear = {-0.35, 0.0};
         break;
-    case 42:
+    case 44:
         equation.initialZMode = InitialZMode::Fixed;
         equation.initialZ = {0.25, 0.15};
         break;
-    case 43:
+    case 45:
         equation.initialZMode = InitialZMode::Parameter;
         break;
-    case 44:
+    case 46:
         equation.power = 4;
         equation.initialZMode = InitialZMode::CriticalPoint;
         equation.quadratic = {0.9, 0.0};
@@ -662,6 +738,7 @@ std::vector<PalettePreset> BuiltInPalettePresets() {
         make("blackbody", "Blackbody", {{0,0,0},{70,0,0},{180,14,0},{255,90,0},{255,214,50},{255,255,255}}),
         make("amethyst-ice", "Amethyst Ice", {{8,0,31},{62,25,117},{132,74,201},{107,187,255},{210,249,255},{255,255,255}}),
         make("arctic-fire", "Arctic Fire", {{0,9,29},{0,118,196},{109,231,255},{255,255,255},{255,149,51},{177,12,0}}),
+        make("cyan-fire-ring", "Cyan Fire Ring", {{84,232,244},{8,191,239},{0,111,216},{0,49,157},{255,248,217},{255,211,78},{255,106,0},{4,29,100}}),
         make("forest-mist", "Forest Mist", {{2,13,7},{12,55,31},{38,112,62},{111,174,108},{199,225,173},{238,244,220}}),
         make("retro-rainbow", "Retro Rainbow", {{30,5,65},{111,31,146},{240,55,146},{255,134,55},{255,226,77},{72,221,183},{52,135,255}}),
         make("peacock", "Peacock", {{0,13,24},{0,66,91},{0,149,137},{49,226,170},{74,116,255},{144,60,217},{255,190,78}}),
@@ -695,7 +772,15 @@ ValidationResult ValidateAndNormalise(Preset& preset) {
     }
     const auto oldScale = preset.camera.scale;
     preset.camera.scale = ClampFinite(preset.camera.scale, 1.0e-32, 4.0, 1.5);
-    if (oldScale != preset.camera.scale) AddIssue(result, "camera.scale", "Scale was outside the supported precision range.");
+    // Schema-3 exact camera text is authoritative. Its finite-double adapter
+    // may intentionally use a tiny positive placeholder for a valid exact
+    // half-height below the legacy range; normalising that adapter must not
+    // reject or replace the exact value during load/save.
+    if (oldScale != preset.camera.scale && !preset.exactCamera.has_value()) {
+        AddIssue(result, "camera.scale", "Scale was outside the supported precision range.");
+    }
+    preset.rotationDegrees = ClampFinite(preset.rotationDegrees, -3600.0, 3600.0, 0.0);
+    preset.rotationDegrees = std::remainder(preset.rotationDegrees, 360.0);
     preset.startingScale = ClampFinite(preset.startingScale, 1.0e-32, 4.0, preset.camera.scale);
     preset.maximumZoom = ClampFinite(preset.maximumZoom, 1.0, 1.0e30, 1.0e30);
     preset.zoomSpeed = ClampFinite(preset.zoomSpeed, 0.0, 2.0, 0.08);
@@ -730,10 +815,21 @@ ValidationResult ValidateAndNormalise(Preset& preset) {
     preset.equation.convergenceTolerance = ClampFinite(preset.equation.convergenceTolerance, 1.0e-12, 0.1, 1.0e-6);
     preset.equation.orbitTrapRadius = ClampFinite(preset.equation.orbitTrapRadius, 1.0e-6, 8.0, 0.5);
     preset.equation.glowStrength = ClampFinite(preset.equation.glowStrength, 0.0, 4.0, 0.0);
+    preset.equation.bloomThreshold = ClampFinite(preset.equation.bloomThreshold, 0.0, 4.0, 0.22);
+    preset.equation.bloomSoftKnee = ClampFinite(preset.equation.bloomSoftKnee, 0.0, 2.0, 0.0);
+    preset.equation.bloomRadius = std::clamp(preset.equation.bloomRadius, 0, 16);
+    preset.equation.edgeLightingStrength = ClampFinite(
+        preset.equation.edgeLightingStrength, 0.0, 4.0, 0.0);
     preset.equation.depthStrength = ClampFinite(preset.equation.depthStrength, 0.0, 4.0, 0.0);
+    preset.equation.stripeDensity = ClampFinite(preset.equation.stripeDensity, 0.1, 128.0, 8.0);
+    preset.equation.stripePhase = ClampFinite(preset.equation.stripePhase, -1000.0, 1000.0, 0.0);
+    preset.equation.stripeStrength = ClampFinite(preset.equation.stripeStrength, 0.0, 2.0, 0.0);
+    preset.equation.stripeStartIteration = std::clamp(preset.equation.stripeStartIteration, 0, 4096);
     preset.equation.coefficientAnimationSpeed = ClampFinite(preset.equation.coefficientAnimationSpeed, 0.0, 8.0, 0.25);
     preset.equation.coefficientAnimationAmplitude = ClampFinite(preset.equation.coefficientAnimationAmplitude, 0.0, 2.0, 0.0);
     preset.colourOffset = ClampFinite(preset.colourOffset, -1000.0, 1000.0, 0.0);
+    preset.paletteFrequency = ClampFinite(preset.paletteFrequency, 0.05, 256.0, 8.0);
+    preset.paletteGamma = ClampFinite(preset.paletteGamma, 0.05, 8.0, 1.0);
     preset.colourCycleSpeed = ClampFinite(preset.colourCycleSpeed, -0.25, 0.25, 0.02);
     preset.brightness = ClampFinite(preset.brightness, 0.1, 2.5, 1.0);
     preset.contrast = ClampFinite(preset.contrast, 0.1, 3.0, 1.0);
@@ -765,7 +861,21 @@ ValidationResult ValidateAndNormalise(Preset& preset) {
     }
     clampColour(preset.interiorColour);
     clampColour(preset.backgroundColour);
+    std::string exactError;
+    if (!EnsureExactCamera(preset, exactError)) {
+        AddIssue(result, "exactCamera", exactError);
+    }
     return result;
+}
+
+bool EnsureExactCamera(Preset& preset, std::string& error) {
+    error.clear();
+    if (!preset.exactCamera.has_value()) {
+        ExactCamera reconstructed;
+        if (!BuildExactCameraFromLegacy(preset.camera, reconstructed, error)) return false;
+        preset.exactCamera = std::move(reconstructed);
+    }
+    return true;
 }
 
 ValidationResult ValidateAndNormalise(PalettePreset& preset) {
@@ -821,10 +931,10 @@ ValidationResult ValidateAndNormalise(EquationPreset& preset) {
 
 ValidationResult ValidateAndNormalise(AppSettings& settings) {
     ValidationResult result;
-    if (settings.schemaVersion < 1 || settings.schemaVersion > 8) {
+    if (settings.schemaVersion < 1 || settings.schemaVersion > 12) {
         AddIssue(result, "schemaVersion", "Unsupported settings version; safe defaults were applied where necessary.");
     }
-    settings.schemaVersion = 8;
+    settings.schemaVersion = 12;
     settings.performance.maximumFrameRate = std::clamp(settings.performance.maximumFrameRate, 5, 240);
     settings.performance.renderScale = ClampFinite(settings.performance.renderScale, 0.25, 1.0, 0.75);
     settings.performance.maximumIterations = std::clamp(settings.performance.maximumIterations, 32, 4096);
@@ -853,6 +963,7 @@ ValidationResult ValidateAndNormalise(AppSettings& settings) {
     settings.performance.adaptive.minimumVisibleColourChange =
         ClampFinite(settings.performance.adaptive.minimumVisibleColourChange, 0.00001, 0.25, 0.001);
     settings.staticWallpaper.cycleSeconds = std::clamp(settings.staticWallpaper.cycleSeconds, 10, 86400);
+    settings.staticWallpaper.compressionQuality = std::clamp(settings.staticWallpaper.compressionQuality, 1, 100);
     if (settings.staticWallpaper.storageDirectory.size() > 32768 ||
         settings.staticWallpaper.storageDirectory.find('\0') != std::string::npos) {
         AddIssue(result, "staticWallpaper.storageDirectory", "The slideshow storage folder was invalid and has been reset.");
@@ -883,6 +994,15 @@ ValidationResult ValidateAndNormalise(AppSettings& settings) {
         settings.staticWallpaper.currentIndex = std::clamp(
             settings.staticWallpaper.currentIndex, 0,
             static_cast<int>(settings.staticWallpaper.imagePaths.size()) - 1);
+    }
+    if (settings.videoWallpaper.filePath.size() > 32768 ||
+        settings.videoWallpaper.filePath.find('\0') != std::string::npos) {
+        AddIssue(result, "videoWallpaper.filePath", "The video wallpaper path was invalid and has been reset.");
+        settings.videoWallpaper.filePath.clear();
+    }
+    if (settings.general.defaultDesktopMode == DesktopMode::Video &&
+        settings.videoWallpaper.filePath.empty()) {
+        settings.general.defaultDesktopMode = DesktopMode::None;
     }
     if (settings.selectedPresetId.empty()) settings.selectedPresetId = "full-view";
     for (auto& preset : settings.customPresets) {
@@ -927,6 +1047,8 @@ std::vector<Preset> BuiltInPresets() {
         preset.name = std::move(name);
         preset.builtIn = true;
         preset.camera = {x, y, scale};
+        std::string exactError;
+        if (!EnsureExactCamera(preset, exactError)) return Preset{};
         preset.startingScale = scale;
         preset.maximumIterations = iterations;
         preset.palette = palette;
@@ -964,7 +1086,10 @@ std::vector<Preset> BuiltInPresets() {
         Preset scene = make(id, name, centreX, centreY, scale, iterations,
                             Palette::ClassicSpectrum, mode, zoomSpeed, colourSpeed, 30, 0.85);
         scene.equation = EquationExample(equationIndex);
-        if (glow >= 0.0) scene.equation.glowStrength = glow;
+        if (glow >= 0.0) {
+            scene.equation.glowStrength = glow;
+            scene.equation.edgeLightingStrength = glow;
+        }
         scene.customPaletteColours = palette(paletteId);
         scene.brightness = 1.05;
         scene.contrast = 1.08;
@@ -975,33 +1100,52 @@ std::vector<Preset> BuiltInPresets() {
 
     // Reference-image equation and palette combinations.
     addScene("reference-classic-blue-gold", "Reference — Classic Blue Gold", 0, "reference-blue-gold", -0.5, 0.0, 1.5, 420, AnimationMode::StaticAnimatedColour, 0.0, 0.012, 0.65);
-    addScene("reference-scaled-c-cyan", "Reference — Scaled c Cyan", 14, "reference-cyan-aurora", -0.5, 0.0, 1.5, 460, AnimationMode::StaticAnimatedColour, 0.0, 0.014, 0.75);
-    addScene("reference-constant-magenta", "Reference — Constant Add Magenta", 15, "reference-magenta-nebula", -0.35, 0.0, 1.65, 520, AnimationMode::StaticAnimatedColour, 0.0, 0.016, 0.8);
-    addScene("reference-scaled-z-gold", "Reference — Scaled z Gold", 16, "reference-golden-halo", -0.3, 0.0, 1.45, 520, AnimationMode::StaticAnimatedColour, 0.0, 0.010, 0.95);
-    addScene("reference-linear-cyan", "Reference — Add to z Cyan", 17, "reference-deep-cyan", -0.5, 0.0, 1.7, 520, AnimationMode::StaticAnimatedColour, 0.0, 0.013, 0.85);
-    addScene("reference-swap-crimson", "Reference — Swap z and c Crimson", 18, "reference-crimson-web", 0.0, 0.0, 1.7, 520, AnimationMode::StaticAnimatedColour, 0.0, 0.014, 0.65);
-    addScene("reference-absolute-ice", "Reference — Absolute z Ice", 19, "reference-ice-lightning", -0.5, -0.45, 1.65, 520, AnimationMode::StaticAnimatedColour, 0.0, 0.012, 0.95);
-    addScene("reference-minus-c-green", "Reference — Minus c Toxic Green", 20, "reference-toxic-green", 0.5, 0.0, 1.5, 520, AnimationMode::StaticAnimatedColour, 0.0, 0.012, 0.8);
+    addScene("reference-scaled-c-cyan", "Reference — Scaled c Cyan", 16, "reference-cyan-aurora", -0.5, 0.0, 1.5, 460, AnimationMode::StaticAnimatedColour, 0.0, 0.014, 0.75);
+    addScene("reference-constant-magenta", "Reference — Constant Add Magenta", 17, "reference-magenta-nebula", -0.35, 0.0, 1.65, 520, AnimationMode::StaticAnimatedColour, 0.0, 0.016, 0.8);
+    addScene("reference-scaled-z-gold", "Reference — Scaled z Gold", 18, "reference-golden-halo", -0.3, 0.0, 1.45, 520, AnimationMode::StaticAnimatedColour, 0.0, 0.010, 0.95);
+    addScene("reference-linear-cyan", "Reference — Add to z Cyan", 19, "reference-deep-cyan", -0.5, 0.0, 1.7, 520, AnimationMode::StaticAnimatedColour, 0.0, 0.013, 0.85);
+    addScene("reference-swap-crimson", "Reference — Swap z and c Crimson", 20, "reference-crimson-web", 0.0, 0.0, 1.7, 520, AnimationMode::StaticAnimatedColour, 0.0, 0.014, 0.65);
+    addScene("reference-absolute-ice", "Reference — Absolute z Ice", 21, "reference-ice-lightning", -0.5, -0.45, 1.65, 520, AnimationMode::StaticAnimatedColour, 0.0, 0.012, 0.95);
+    addScene("reference-minus-c-green", "Reference — Minus c Toxic Green", 22, "reference-toxic-green", 0.5, 0.0, 1.5, 520, AnimationMode::StaticAnimatedColour, 0.0, 0.012, 0.8);
 
     // Additional equation-library scenes.
     addScene("cubic-aurora", "Cubic Aurora", 1, "reference-cyan-aurora", 0.0, 0.0, 1.45, 540, AnimationMode::AutomaticJourney, 0.035, 0.012, 0.55);
-    addScene("quartic-amethyst", "Quartic Amethyst", 21, "royal-amethyst", 0.0, 0.0, 1.35, 580, AnimationMode::ContinuousZoom, 0.03, 0.014, 0.7);
+    addScene("quartic-amethyst", "Quartic Amethyst", 23, "royal-amethyst", 0.0, 0.0, 1.35, 580, AnimationMode::ContinuousZoom, 0.03, 0.014, 0.7);
     addScene("quintic-nebula", "Quintic Nebula", 2, "blue-magenta", 0.0, 0.0, 1.25, 620, AnimationMode::ContinuousZoom, 0.028, 0.016, 0.75);
-    addScene("octic-rainbow", "Octic Retro Rainbow", 23, "retro-rainbow", 0.0, 0.0, 1.12, 720, AnimationMode::StaticAnimatedColour, 0.0, 0.018, 0.55);
+    addScene("octic-rainbow", "Octic Retro Rainbow", 25, "retro-rainbow", 0.0, 0.0, 1.12, 720, AnimationMode::StaticAnimatedColour, 0.0, 0.018, 0.55);
     addScene("burning-ship-inferno", "Burning Ship Inferno", 3, "sunset-inferno", -0.45, -0.55, 1.45, 620, AnimationMode::ContinuousZoom, 0.03, 0.012, 0.9);
     addScene("tricorn-arctic", "Tricorn Arctic Fire", 4, "arctic-fire", 0.0, 0.0, 1.7, 580, AnimationMode::AutomaticJourney, 0.03, 0.01, 0.65);
-    addScene("julia-dragon-vaporwave", "Julia Dragon Vaporwave", 24, "vaporwave", 0.0, 0.0, 1.45, 620, AnimationMode::StaticAnimatedColour, 0.0, 0.018, 0.7);
-    addScene("julia-rabbit-candy", "Julia Rabbit Neon Candy", 25, "neon-candy", 0.0, 0.0, 1.35, 620, AnimationMode::StaticAnimatedColour, 0.0, 0.02, 0.65);
-    addScene("julia-dendrite-glacier", "Julia Dendrite Glacier", 26, "glacier", 0.0, 0.0, 1.35, 680, AnimationMode::StaticAnimatedColour, 0.0, 0.012, 0.75);
-    addScene("newton-three-royal", "Newton Three Royal", 8, "royal-amethyst", 0.0, 0.0, 1.65, 160, AnimationMode::StaticAnimatedColour, 0.0, 0.012, 0.8);
-    addScene("newton-five-solar", "Newton Five Solar", 29, "solar-flare", 0.0, 0.0, 1.65, 180, AnimationMode::StaticAnimatedColour, 0.0, 0.014, 0.8);
-    addScene("rational-copper", "Rational Copper", 6, "amber-copper", 0.0, 0.0, 2.0, 480, AnimationMode::StaticAnimatedColour, 0.0, 0.012, 0.65);
-    addScene("sine-abyss", "Sine Abyss", 9, "abyssal-ocean", 0.0, 0.0, 2.2, 420, AnimationMode::StaticAnimatedColour, 0.0, 0.012, 0.55);
-    addScene("cosine-midnight", "Cosine Midnight Rose", 10, "midnight-rose", 0.0, 0.0, 2.2, 420, AnimationMode::StaticAnimatedColour, 0.0, 0.014, 0.55);
-    addScene("exponential-emerald", "Exponential Emerald", 11, "emerald-gold", 0.0, 0.0, 2.0, 360, AnimationMode::StaticAnimatedColour, 0.0, 0.012, 0.65);
-    addScene("orbit-cross-peacock", "Orbit Cross Peacock", 34, "peacock", -0.5, 0.0, 1.5, 520, AnimationMode::StaticAnimatedColour, 0.0, 0.016, 1.15);
-    addScene("distance-glacier", "Distance Depth Glacier", 13, "glacier", -0.743, 0.131, 0.03, 720, AnimationMode::ContinuousZoom, 0.025, 0.008, 0.65);
-    addScene("animated-rainbow", "Animated Coefficient Rainbow", 36, "retro-rainbow", -0.5, 0.0, 1.5, 480, AnimationMode::StaticAnimatedColour, 0.0, 0.012, 0.75);
+    addScene("tricorn-cyan-fire-ring", "Tricorn Cyan Fire Ring", 4, "cyan-fire-ring", 0.0, 0.0, 1.7, 1200, AnimationMode::ManualView, 0.0, 0.0, 0.75);
+    presets.back().paletteFrequency = 28.0;
+    presets.back().paletteGamma = 0.85;
+    presets.back().paletteInterpolation = PaletteInterpolation::Smoothstep;
+    presets.back().equation.stripeAverageEnabled = true;
+    presets.back().equation.stripeDensity = 9.0;
+    presets.back().equation.stripePhase = 0.0;
+    presets.back().equation.stripeStrength = 0.16;
+    presets.back().equation.stripeStartIteration = 10;
+    presets.back().equation.colouringMethod = ColouringMethod::DistanceEstimation;
+    presets.back().equation.edgeLightingStrength = 0.65;
+    presets.back().equation.glowStrength = 0.30;
+    presets.back().equation.bloomThreshold = 0.65;
+    presets.back().equation.bloomSoftKnee = 0.10;
+    presets.back().equation.bloomRadius = 3;
+    presets.back().brightness = 1.02;
+    presets.back().contrast = 1.18;
+    presets.back().saturation = 1.10;
+    presets.back().antiAliasingLevel = 4;
+    addScene("julia-dragon-vaporwave", "Julia Dragon Vaporwave", 26, "vaporwave", 0.0, 0.0, 1.45, 620, AnimationMode::StaticAnimatedColour, 0.0, 0.018, 0.7);
+    addScene("julia-rabbit-candy", "Julia Rabbit Neon Candy", 27, "neon-candy", 0.0, 0.0, 1.35, 620, AnimationMode::StaticAnimatedColour, 0.0, 0.02, 0.65);
+    addScene("julia-dendrite-glacier", "Julia Dendrite Glacier", 28, "glacier", 0.0, 0.0, 1.35, 680, AnimationMode::StaticAnimatedColour, 0.0, 0.012, 0.75);
+    addScene("newton-three-royal", "Newton Three Royal", 10, "royal-amethyst", 0.0, 0.0, 1.65, 160, AnimationMode::StaticAnimatedColour, 0.0, 0.012, 0.8);
+    addScene("newton-five-solar", "Newton Five Solar", 31, "solar-flare", 0.0, 0.0, 1.65, 180, AnimationMode::StaticAnimatedColour, 0.0, 0.014, 0.8);
+    addScene("rational-copper", "Rational Copper", 8, "amber-copper", 0.0, 0.0, 2.0, 480, AnimationMode::StaticAnimatedColour, 0.0, 0.012, 0.65);
+    addScene("sine-abyss", "Sine Abyss", 11, "abyssal-ocean", 0.0, 0.0, 2.2, 420, AnimationMode::StaticAnimatedColour, 0.0, 0.012, 0.55);
+    addScene("cosine-midnight", "Cosine Midnight Rose", 12, "midnight-rose", 0.0, 0.0, 2.2, 420, AnimationMode::StaticAnimatedColour, 0.0, 0.014, 0.55);
+    addScene("exponential-emerald", "Exponential Emerald", 13, "emerald-gold", 0.0, 0.0, 2.0, 360, AnimationMode::StaticAnimatedColour, 0.0, 0.012, 0.65);
+    addScene("orbit-cross-peacock", "Orbit Cross Peacock", 36, "peacock", -0.5, 0.0, 1.5, 520, AnimationMode::StaticAnimatedColour, 0.0, 0.016, 1.15);
+    addScene("distance-glacier", "Distance Depth Glacier", 15, "glacier", -0.743, 0.131, 0.03, 720, AnimationMode::ContinuousZoom, 0.025, 0.008, 0.65);
+    addScene("animated-rainbow", "Animated Coefficient Rainbow", 38, "retro-rainbow", -0.5, 0.0, 1.5, 480, AnimationMode::StaticAnimatedColour, 0.0, 0.012, 0.75);
 
     return presets;
 }

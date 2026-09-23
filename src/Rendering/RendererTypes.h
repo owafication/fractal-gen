@@ -15,11 +15,15 @@ struct RenderRegion {
     RECT pixels{};
 #endif
     CameraState camera;
+    double rotationDegrees{0.0};
     Palette palette{Palette::ClassicSpectrum};
     std::vector<Colour> customPaletteColours;
     int maximumIterations{300};
     EquationSettings equation;
     double colourOffset{0.0};
+    double paletteFrequency{8.0};
+    double paletteGamma{1.0};
+    PaletteInterpolation paletteInterpolation{PaletteInterpolation::Linear};
     double brightness{1.0};
     double contrast{1.0};
     double saturation{1.0};

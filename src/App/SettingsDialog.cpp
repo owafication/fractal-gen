@@ -2,11 +2,12 @@
 #include "App/DialogSupport.h"
 #include "App/PrecisionDialog.h"
 #include "App/AdaptivePerformanceDialog.h"
-#include "WindowsIntegration/DisplayManager.h"
+#include "App/JourneySettingsDialog.h"
 
 #ifdef _WIN32
 #include <commctrl.h>
 #include <commdlg.h>
+#include <shlobj.h>
 #endif
 
 #include <algorithm>
@@ -14,6 +15,7 @@
 #include <cwchar>
 #include <iomanip>
 #include <iterator>
+#include <functional>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -27,6 +29,7 @@ constexpr wchar_t kSettingsClass[] = L"MandelbrotLiveWallpaperSettingsDialog";
 
 enum Id : int {
     MaximumZoomEdit = 5001,
+    RotationDegreesEdit,
     MaximumIterationsEdit,
     PerformanceProfileCombo,
     FrameRateEdit,
@@ -40,7 +43,6 @@ enum Id : int {
     PrecisionButton,
     AdaptiveButton,
     StartWindowsCheck,
-    StartWallpaperCheck,
     MinimiseTrayCheck,
     FullscreenCheck,
     BatteryPauseCheck,
@@ -50,10 +52,14 @@ enum Id : int {
     ReduceBatteryCheck,
     ReducedMotionCheck,
     MonitorModeCombo,
-    MonitorCombo,
-    MonitorPresetCombo,
-    ApplyAssignmentButton,
-    JourneyWaypointsEdit,
+    RetiredMonitorCombo,
+    RetiredMonitorPresetCombo,
+    RetiredApplyAssignmentButton,
+    OutputDirectoryEdit,
+    BrowseOutputButton,
+    OutputFormatCombo,
+    CompressionQualityEdit,
+    JourneySettingsButton,
     OkButton,
     CancelButton,
 };
@@ -64,13 +70,12 @@ struct DialogState {
     HINSTANCE instance{nullptr};
     AppSettings* settings{nullptr};
     Preset* preset{nullptr};
-    const std::vector<Preset>* presets{nullptr};
-    std::vector<DisplayInfo> displays;
     HFONT font{nullptr};
     ResponsiveDialogLayout layout;
     UINT dpi{96};
     bool accepted{false};
     bool done{false};
+    std::function<void()> onChanged;
     Colour interior;
     Colour background;
     PrecisionSettings precision;
@@ -131,7 +136,7 @@ Colour FromColorRef(COLORREF colour) {
             GetBValue(colour) / 255.0F, 1.0F};
 }
 
-void PickColour(DialogState& state, bool interior) {
+bool PickColour(DialogState& state, bool interior) {
     static COLORREF customColours[16]{};
     CHOOSECOLORW chooser{};
     chooser.lStructSize = sizeof(chooser);
@@ -139,10 +144,10 @@ void PickColour(DialogState& state, bool interior) {
     chooser.rgbResult = ToColorRef(interior ? state.interior : state.background);
     chooser.lpCustColors = customColours;
     chooser.Flags = CC_FULLOPEN | CC_RGBINIT;
-    if (ChooseColorW(&chooser)) {
-        if (interior) state.interior = FromColorRef(chooser.rgbResult);
-        else state.background = FromColorRef(chooser.rgbResult);
-    }
+    if (!ChooseColorW(&chooser)) return false;
+    if (interior) state.interior = FromColorRef(chooser.rgbResult);
+    else state.background = FromColorRef(chooser.rgbResult);
+    return true;
 }
 
 std::wstring ReadText(HWND window, int id) {
@@ -166,37 +171,18 @@ double ReadDouble(HWND window, int id, double fallback) {
     try { return std::stod(ReadText(window, id)); } catch (...) { return fallback; }
 }
 
-void UpdateMonitorControlState(DialogState& state) {
-    const int mode = static_cast<int>(SendMessageW(GetDlgItem(state.window, MonitorModeCombo), CB_GETCURSEL, 0, 0));
-    const bool independent = mode == static_cast<int>(MonitorMode::Independent);
-    EnableWindow(GetDlgItem(state.window, MonitorCombo), independent);
-    EnableWindow(GetDlgItem(state.window, MonitorPresetCombo), independent);
-    EnableWindow(GetDlgItem(state.window, ApplyAssignmentButton), independent);
-}
-
-void PopulateMonitorAssignment(DialogState& state) {
-    HWND monitor = GetDlgItem(state.window, MonitorCombo);
-    HWND preset = GetDlgItem(state.window, MonitorPresetCombo);
-    const int monitorIndex = static_cast<int>(SendMessageW(monitor, CB_GETCURSEL, 0, 0));
-    if (monitorIndex < 0 || monitorIndex >= static_cast<int>(state.displays.size())) return;
-    const std::string key = WideToUtf8(state.displays[static_cast<std::size_t>(monitorIndex)].deviceName);
-    const auto found = state.settings->monitorPresetAssignments.find(key);
-    const std::string assignedId = found == state.settings->monitorPresetAssignments.end()
-        ? state.settings->selectedPresetId : found->second;
-    int selected = 0;
-    for (std::size_t index = 0; index < state.presets->size(); ++index) {
-        if ((*state.presets)[index].id == assignedId) selected = static_cast<int>(index);
-    }
-    SendMessageW(preset, CB_SETCURSEL, selected, 0);
-}
-
-void ApplyMonitorAssignment(DialogState& state) {
-    const int monitorIndex = static_cast<int>(SendMessageW(GetDlgItem(state.window, MonitorCombo), CB_GETCURSEL, 0, 0));
-    const int presetIndex = static_cast<int>(SendMessageW(GetDlgItem(state.window, MonitorPresetCombo), CB_GETCURSEL, 0, 0));
-    if (monitorIndex < 0 || monitorIndex >= static_cast<int>(state.displays.size()) ||
-        presetIndex < 0 || presetIndex >= static_cast<int>(state.presets->size())) return;
-    const std::string key = WideToUtf8(state.displays[static_cast<std::size_t>(monitorIndex)].deviceName);
-    state.settings->monitorPresetAssignments[key] = (*state.presets)[static_cast<std::size_t>(presetIndex)].id;
+std::wstring BrowseForFolder(HWND owner, const std::wstring& initialDirectory) {
+    BROWSEINFOW browse{};
+    browse.hwndOwner = owner;
+    browse.lpszTitle = L"Select the default folder for static renders, saved images and slideshow captures";
+    browse.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
+    PIDLIST_ABSOLUTE selected = SHBrowseForFolderW(&browse);
+    if (!selected) return {};
+    wchar_t path[MAX_PATH]{};
+    const bool resolved = SHGetPathFromIDListW(selected, path) != FALSE;
+    CoTaskMemFree(selected);
+    if (resolved) return path;
+    return initialDirectory;
 }
 
 void ApplyProfileDefaults(DialogState& state) {
@@ -212,6 +198,7 @@ void ApplyProfileDefaults(DialogState& state) {
 
 void Save(DialogState& state) {
     state.preset->maximumZoom = ReadDouble(state.window, MaximumZoomEdit, state.preset->maximumZoom);
+    state.preset->rotationDegrees = ReadDouble(state.window, RotationDegreesEdit, state.preset->rotationDegrees);
     state.preset->maximumIterations = ReadInt(state.window, MaximumIterationsEdit, state.preset->maximumIterations);
     state.settings->performance.maximumIterations = state.preset->maximumIterations;
     state.settings->performance.maximumFrameRate = ReadInt(state.window, FrameRateEdit, state.settings->performance.maximumFrameRate);
@@ -233,7 +220,6 @@ void Save(DialogState& state) {
     state.settings->performance.adaptive = state.adaptive;
 
     state.settings->general.startWithWindows = Checked(state.window, StartWindowsCheck);
-    state.settings->general.startWallpaperOnLaunch = Checked(state.window, StartWallpaperCheck);
     state.settings->general.minimiseToTray = Checked(state.window, MinimiseTrayCheck);
     state.settings->general.reducedMotion = Checked(state.window, ReducedMotionCheck);
     state.settings->performance.pauseWhenFullscreen = Checked(state.window, FullscreenCheck);
@@ -245,13 +231,17 @@ void Save(DialogState& state) {
 
     const int monitorMode = static_cast<int>(SendMessageW(GetDlgItem(state.window, MonitorModeCombo), CB_GETCURSEL, 0, 0));
     state.settings->monitorMode = monitorMode >= 0 ? static_cast<MonitorMode>(monitorMode) : MonitorMode::Mirror;
-    ApplyMonitorAssignment(state);
 
-    const std::wstring waypoints = ReadText(state.window, JourneyWaypointsEdit);
-    state.preset->automaticJourneyWaypoints = WideToUtf8(waypoints);
+    state.settings->staticWallpaper.storageDirectory = WideToUtf8(ReadText(state.window, OutputDirectoryEdit));
+    const int outputFormat = static_cast<int>(SendMessageW(GetDlgItem(state.window, OutputFormatCombo), CB_GETCURSEL, 0, 0));
+    state.settings->staticWallpaper.savedImageFormat = outputFormat >= 0 && outputFormat <= 3
+        ? static_cast<SavedImageFormat>(outputFormat) : SavedImageFormat::Png;
+    state.settings->staticWallpaper.compressionQuality =
+        ReadInt(state.window, CompressionQualityEdit, state.settings->staticWallpaper.compressionQuality);
 
     ValidateAndNormalise(*state.preset);
     ValidateAndNormalise(*state.settings);
+    if (state.onChanged) state.onChanged();
 }
 
 LRESULT CALLBACK Procedure(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
@@ -274,7 +264,7 @@ LRESULT CALLBACK Procedure(HWND window, UINT message, WPARAM wParam, LPARAM lPar
             leftX, 12, groupWidth, 610, state->font);
         Add(window, state->instance, WC_BUTTONW, L"System behaviour", BS_GROUPBOX, 0,
             centreX, 12, groupWidth, 610, state->font);
-        Add(window, state->instance, WC_BUTTONW, L"Monitors and journey", BS_GROUPBOX, 0,
+        Add(window, state->instance, WC_BUTTONW, L"Monitors and output", BS_GROUPBOX, 0,
             rightX, 12, groupWidth, 610, state->font);
 
         int y = 42;
@@ -287,6 +277,9 @@ LRESULT CALLBACK Procedure(HWND window, UINT message, WPARAM wParam, LPARAM lPar
         std::wostringstream zoom;
         zoom << std::setprecision(12) << state->preset->maximumZoom;
         labelEdit(L"Maximum zoom", MaximumZoomEdit, zoom.str());
+        std::wostringstream rotation;
+        rotation << std::setprecision(8) << state->preset->rotationDegrees;
+        labelEdit(L"View rotation °", RotationDegreesEdit, rotation.str());
         labelEdit(L"Iterations", MaximumIterationsEdit, std::to_wstring(state->preset->maximumIterations));
 
         Add(window, state->instance, WC_STATICW, L"Performance", SS_LEFT, 0, leftX + 12, y + 4, 125, 22, state->font);
@@ -337,7 +330,6 @@ LRESULT CALLBACK Procedure(HWND window, UINT message, WPARAM wParam, LPARAM lPar
             systemY += 34;
         };
         check(StartWindowsCheck, L"Start with Windows", state->settings->general.startWithWindows);
-        check(StartWallpaperCheck, L"Start wallpaper when app launches", state->settings->general.startWallpaperOnLaunch);
         check(MinimiseTrayCheck, L"Close control window to tray", state->settings->general.minimiseToTray);
         check(FullscreenCheck, L"Pause for full-screen applications", state->settings->performance.pauseWhenFullscreen);
         check(BatteryPauseCheck, L"Pause on battery", state->settings->performance.pauseOnBattery);
@@ -347,7 +339,7 @@ LRESULT CALLBACK Procedure(HWND window, UINT message, WPARAM wParam, LPARAM lPar
         check(ReduceBatteryCheck, L"Reduce quality on battery", state->settings->performance.reduceQualityOnBattery);
         check(ReducedMotionCheck, L"Reduced Motion", state->settings->general.reducedMotion);
         Add(window, state->instance, WC_STATICW,
-            L"Live/static/slideshow actions are available from the preview hover menu and the movable Quick Controller.",
+            L"Choose and apply the desktop mode from the Desktop page. Only the selected default mode starts automatically at launch.",
             SS_LEFT, 0, centreX + 12, systemY + 8, 276, 74, state->font);
 
         int monitorY = 42;
@@ -355,47 +347,45 @@ LRESULT CALLBACK Procedure(HWND window, UINT message, WPARAM wParam, LPARAM lPar
             rightX + 12, monitorY + 4, 118, 22, state->font);
         HWND monitorMode = Add(window, state->instance, WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_TABSTOP,
                                MonitorModeCombo, rightX + 136, monitorY, 150, 150, state->font);
-        for (const wchar_t* item : {L"Mirror", L"Span", L"Independent"})
+        for (const wchar_t* item : {L"Mirror", L"Span"})
             SendMessageW(monitorMode, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(item));
         SendMessageW(monitorMode, CB_SETCURSEL, static_cast<WPARAM>(state->settings->monitorMode), 0);
         monitorY += 40;
 
-        Add(window, state->instance, WC_STATICW, L"Monitor", SS_LEFT, 0,
+        Add(window, state->instance, WC_STATICW, L"Default image folder", SS_LEFT, 0,
             rightX + 12, monitorY + 4, 118, 22, state->font);
-        HWND monitorCombo = Add(window, state->instance, WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_TABSTOP,
-                                MonitorCombo, rightX + 136, monitorY, 150, 190, state->font);
-        for (const auto& display : state->displays) {
-            std::wostringstream description;
-            description << display.friendlyName << L" (" << (display.bounds.right - display.bounds.left)
-                        << L"x" << (display.bounds.bottom - display.bounds.top) << L")";
-            SendMessageW(monitorCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(description.str().c_str()));
-        }
-        if (!state->displays.empty()) SendMessageW(monitorCombo, CB_SETCURSEL, 0, 0);
+        Add(window, state->instance, WC_EDITW,
+            Utf8ToWide(state->settings->staticWallpaper.storageDirectory).c_str(),
+            ES_AUTOHSCROLL | WS_TABSTOP, OutputDirectoryEdit,
+            rightX + 12, monitorY + 28, 210, 26, state->font, WS_EX_CLIENTEDGE);
+        Add(window, state->instance, WC_BUTTONW, L"Browse...", BS_PUSHBUTTON | WS_TABSTOP,
+            BrowseOutputButton, rightX + 228, monitorY + 26, 58, 30, state->font);
+        monitorY += 66;
+
+        Add(window, state->instance, WC_STATICW, L"Saved image type", SS_LEFT, 0,
+            rightX + 12, monitorY + 4, 118, 22, state->font);
+        HWND outputFormat = Add(window, state->instance, WC_COMBOBOXW, L"",
+            CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, OutputFormatCombo,
+            rightX + 136, monitorY, 150, 150, state->font);
+        for (const wchar_t* item : {L"PNG", L"JPEG", L"TIFF", L"BMP"})
+            SendMessageW(outputFormat, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(item));
+        SendMessageW(outputFormat, CB_SETCURSEL,
+                     static_cast<WPARAM>(state->settings->staticWallpaper.savedImageFormat), 0);
         monitorY += 40;
 
-        Add(window, state->instance, WC_STATICW, L"Assigned preset", SS_LEFT, 0,
+        Add(window, state->instance, WC_STATICW, L"Compression / quality", SS_LEFT, 0,
             rightX + 12, monitorY + 4, 118, 22, state->font);
-        HWND monitorPreset = Add(window, state->instance, WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_TABSTOP,
-                                 MonitorPresetCombo, rightX + 136, monitorY, 150, 190, state->font);
-        for (const auto& preset : *state->presets) {
-            const std::wstring name = Utf8ToWide(preset.name);
-            SendMessageW(monitorPreset, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(name.c_str()));
-        }
-        monitorY += 40;
-        Add(window, state->instance, WC_BUTTONW, L"Apply monitor assignment", BS_PUSHBUTTON | WS_TABSTOP,
-            ApplyAssignmentButton, rightX + 12, monitorY, 274, 30, state->font);
-        monitorY += 44;
-        PopulateMonitorAssignment(*state);
-        UpdateMonitorControlState(*state);
-
+        Add(window, state->instance, WC_EDITW,
+            std::to_wstring(state->settings->staticWallpaper.compressionQuality).c_str(),
+            ES_AUTOHSCROLL | ES_NUMBER | WS_TABSTOP, CompressionQualityEdit,
+            rightX + 136, monitorY, 150, 26, state->font, WS_EX_CLIENTEDGE);
+        monitorY += 42;
         Add(window, state->instance, WC_STATICW,
-            L"Ordered Automatic Journey (optional)\r\nX,Y,Scale,TransitionSeconds,HoldSeconds — one destination per line",
-            SS_LEFT, 0, rightX + 12, monitorY, 276, 62, state->font);
-        monitorY += 64;
-        const std::wstring waypointText = Utf8ToWide(state->preset->automaticJourneyWaypoints);
-        Add(window, state->instance, WC_EDITW, waypointText.c_str(),
-            ES_MULTILINE | ES_AUTOVSCROLL | WS_VSCROLL | WS_TABSTOP,
-            JourneyWaypointsEdit, rightX + 12, monitorY, 274, 190, state->font, WS_EX_CLIENTEDGE);
+            L"1–100. JPEG uses image quality; lossless formats use their available compression profile. BMP remains uncompressed.",
+            SS_LEFT, 0, rightX + 12, monitorY, 274, 54, state->font);
+        monitorY += 60;
+        Add(window, state->instance, WC_BUTTONW, L"Journey settings...", BS_PUSHBUTTON | WS_TABSTOP,
+            JourneySettingsButton, rightX + 12, monitorY, 274, 32, state->font);
 
         Add(window, state->instance, WC_BUTTONW, L"&OK", BS_DEFPUSHBUTTON | WS_TABSTOP,
             OkButton, 720, 635, 102, 32, state->font);
@@ -429,21 +419,38 @@ LRESULT CALLBACK Procedure(HWND window, UINT message, WPARAM wParam, LPARAM lPar
     }
 
     if (message == WM_COMMAND) {
+        if (!IsWindowEnabled(window)) return 0;
         const int id = LOWORD(wParam);
-        if (id == InteriorButton) PickColour(*state, true);
-        else if (id == BackgroundButton) PickColour(*state, false);
-        else if (id == PrecisionButton) PrecisionDialog::Show(state->window, state->instance, state->precision);
-        else if (id == AdaptiveButton) AdaptivePerformanceDialog::Show(state->window, state->instance, state->adaptive);
+        if (id == InteriorButton) {
+            if (PickColour(*state, true)) Save(*state);
+        }
+        else if (id == BackgroundButton) {
+            if (PickColour(*state, false)) Save(*state);
+        }
+        else if (id == PrecisionButton) {
+            if (PrecisionDialog::Show(state->window, state->instance, state->precision)) Save(*state);
+        }
+        else if (id == AdaptiveButton) {
+            if (AdaptivePerformanceDialog::Show(state->window, state->instance, state->adaptive)) Save(*state);
+        }
         else if (id == PerformanceProfileCombo && HIWORD(wParam) == CBN_SELCHANGE) ApplyProfileDefaults(*state);
-        else if (id == MonitorModeCombo && HIWORD(wParam) == CBN_SELCHANGE) UpdateMonitorControlState(*state);
-        else if (id == MonitorCombo && HIWORD(wParam) == CBN_SELCHANGE) PopulateMonitorAssignment(*state);
-        else if (id == ApplyAssignmentButton) ApplyMonitorAssignment(*state);
+        else if (id == BrowseOutputButton) {
+            const std::wstring selected = BrowseForFolder(window, ReadText(window, OutputDirectoryEdit));
+            if (!selected.empty()) SetText(window, OutputDirectoryEdit, selected);
+        }
+        else if (id == JourneySettingsButton) {
+            JourneySettingsDialog::Show(state->window, state->instance, *state->preset, [state] {
+                if (state->onChanged) state->onChanged();
+            });
+        }
         else if (id == OkButton) {
             Save(*state);
             state->accepted = true;
             DestroyWindow(window);
         } else if (id == CancelButton) {
             DestroyWindow(window);
+        } else {
+            Save(*state);
         }
         return 0;
     }
@@ -457,8 +464,6 @@ LRESULT CALLBACK Procedure(HWND window, UINT message, WPARAM wParam, LPARAM lPar
         if (state->font) DeleteObject(state->font);
         state->font = nullptr;
         state->done = true;
-        EnableWindow(state->owner, TRUE);
-        SetForegroundWindow(state->owner);
         return 0;
     }
     return DefWindowProcW(window, message, wParam, lParam);
@@ -467,7 +472,7 @@ LRESULT CALLBACK Procedure(HWND window, UINT message, WPARAM wParam, LPARAM lPar
 } // namespace
 
 bool SettingsDialog::Show(HWND owner, HINSTANCE instance, AppSettings& settings, Preset& preset,
-                          const std::vector<Preset>& presets) {
+                          const std::vector<Preset>& presets, std::function<void()> onChanged) {
     WNDCLASSEXW windowClass{};
     windowClass.cbSize = sizeof(windowClass);
     windowClass.lpfnWndProc = Procedure;
@@ -482,8 +487,8 @@ bool SettingsDialog::Show(HWND owner, HINSTANCE instance, AppSettings& settings,
     state.instance = instance;
     state.settings = &settings;
     state.preset = &preset;
-    state.presets = &presets;
-    state.displays = DisplayManager::Enumerate();
+    (void)presets;
+    state.onChanged = std::move(onChanged);
     state.interior = preset.interiorColour;
     state.background = preset.backgroundColour;
     state.precision = settings.performance.precision;
@@ -491,14 +496,13 @@ bool SettingsDialog::Show(HWND owner, HINSTANCE instance, AppSettings& settings,
 
     state.dpi = DialogDpi(owner);
     const RECT dialogRect = ResponsiveDialogRect(owner, 970, 720, state.dpi, kSettingsClass);
-    HWND window = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_CONTROLPARENT, kSettingsClass, L"Mandelbrot Settings",
-                                  WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_MAXIMIZEBOX |
-                                  WS_POPUP | WS_VISIBLE | WS_VSCROLL | WS_HSCROLL,
+    HWND window = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_CONTROLPARENT, kSettingsClass, L"Mandelbrot Settings",
+                                  WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_MAXIMIZEBOX |
+                                  WS_VISIBLE | WS_VSCROLL | WS_HSCROLL,
                                   dialogRect.left, dialogRect.top,
                                   dialogRect.right - dialogRect.left, dialogRect.bottom - dialogRect.top,
                                   owner, nullptr, instance, &state);
     if (!window) return false;
-    EnableWindow(owner, FALSE);
 
     MSG message{};
     while (!state.done && GetMessageW(&message, nullptr, 0, 0) > 0) {

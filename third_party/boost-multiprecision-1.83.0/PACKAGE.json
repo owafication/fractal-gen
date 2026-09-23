@@ -1,0 +1,34 @@
+{
+  "schema": 1,
+  "name": "boost-multiprecision-standalone",
+  "version": "1.83.0",
+  "sourceProvenance": {
+    "distributionPackage": "libboost1.83-dev",
+    "distributionVersion": "1.83.0-4.2",
+    "upstreamArchive": "boost_1_83_0.tar.bz2",
+    "upstreamArchiveSha256": "6478edfe2f3305127cffe8caf73ea0176c53769f4bf1585be237eb30798c3b8e"
+  },
+  "licence": "BSL-1.0",
+  "linkage": "header-only",
+  "runtimeArtifacts": [],
+  "compileDefinitions": [
+    "BOOST_MP_STANDALONE"
+  ],
+  "includedPaths": [
+    "include/boost/multiprecision",
+    "include/boost/config",
+    "include/boost/config.hpp",
+    "include/boost/version.hpp",
+    "LICENSE_1_0.txt"
+  ],
+  "excluded": [
+    "Boost binaries",
+    "Boost.Build",
+    "Boost.Math",
+    "GMP",
+    "MPFR",
+    "network acquisition during configure or build"
+  ],
+  "contentIndexSha256": "8e562940faba426120edf565ff2566aad689ef1605ee334aaeb35d8d6ff8a85d",
+  "contentFileCount": 178
+}

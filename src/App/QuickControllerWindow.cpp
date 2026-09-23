@@ -70,12 +70,12 @@ void QuickControllerWindow::CreateControls() {
     const int column3 = column2 + buttonWidth + gap;
     const int column4 = column3 + buttonWidth + gap;
 
-    applyLiveButton_ = Add(window_, instance_, WC_BUTTONW, L"Apply Settings Live", BS_DEFPUSHBUTTON | WS_TABSTOP,
-                           QuickControllerCommands::ApplySettingsLive, left, top, buttonWidth, buttonHeight, font_);
-    staticDesktopButton_ = Add(window_, instance_, WC_BUTTONW, L"Static Desktop", BS_PUSHBUTTON | WS_TABSTOP,
-                               QuickControllerCommands::StaticDesktop, column2, top, buttonWidth, buttonHeight, font_);
+    staticDesktopButton_ = Add(window_, instance_, WC_BUTTONW, L"Static Desktop", BS_DEFPUSHBUTTON | WS_TABSTOP,
+                               QuickControllerCommands::StaticDesktop, left, top, buttonWidth, buttonHeight, font_);
     slideshowDesktopButton_ = Add(window_, instance_, WC_BUTTONW, L"Slideshow Desktop", BS_PUSHBUTTON | WS_TABSTOP,
-                                  QuickControllerCommands::SlideshowDesktop, column3, top, buttonWidth, buttonHeight, font_);
+                                  QuickControllerCommands::SlideshowDesktop, column2, top, buttonWidth, buttonHeight, font_);
+    videoDesktopButton_ = Add(window_, instance_, WC_BUTTONW, L"Video Desktop...", BS_PUSHBUTTON | WS_TABSTOP,
+                              QuickControllerCommands::VideoDesktop, column3, top, buttonWidth, buttonHeight, font_);
     jumpCoordinatesButton_ = Add(window_, instance_, WC_BUTTONW, L"Jump to Coordinates...", BS_PUSHBUTTON | WS_TABSTOP,
                                  QuickControllerCommands::JumpToCoordinates, column4, top, buttonWidth, buttonHeight, font_);
 
@@ -83,30 +83,29 @@ void QuickControllerWindow::CreateControls() {
                              QuickControllerCommands::TogglePreviewZoom, left, top + rowStep, buttonWidth, buttonHeight, font_);
     previewColourButton_ = Add(window_, instance_, WC_BUTTONW, L"Start Preview Colours", BS_PUSHBUTTON | WS_TABSTOP,
                                QuickControllerCommands::TogglePreviewColours, column2, top + rowStep, buttonWidth, buttonHeight, font_);
-    desktopZoomButton_ = Add(window_, instance_, WC_BUTTONW, L"Start Desktop Zoom", BS_PUSHBUTTON | WS_TABSTOP,
-                             QuickControllerCommands::ToggleDesktopZoom, column3, top + rowStep, buttonWidth, buttonHeight, font_);
-    desktopColourButton_ = Add(window_, instance_, WC_BUTTONW, L"Start Desktop Colours", BS_PUSHBUTTON | WS_TABSTOP,
-                               QuickControllerCommands::ToggleDesktopColours, column4, top + rowStep, buttonWidth, buttonHeight, font_);
-
-    saveImageButton_ = Add(window_, instance_, WC_BUTTONW, L"Save Image", BS_PUSHBUTTON | WS_TABSTOP,
-                           QuickControllerCommands::SaveImage, left, top + rowStep * 2, buttonWidth, buttonHeight, font_);
+    saveImageButton_ = Add(window_, instance_, WC_BUTTONW, L"Add to Slideshow", BS_PUSHBUTTON | WS_TABSTOP,
+                           QuickControllerCommands::SaveImage, column3, top + rowStep, buttonWidth, buttonHeight, font_);
     renderHighResButton_ = Add(window_, instance_, WC_BUTTONW, L"Render Hi-Res...", BS_PUSHBUTTON | WS_TABSTOP,
-                               QuickControllerCommands::RenderHighRes, column2, top + rowStep * 2, buttonWidth, buttonHeight, font_);
+                               QuickControllerCommands::RenderHighRes, column4, top + rowStep, buttonWidth, buttonHeight, font_);
     copyCoordinatesButton_ = Add(window_, instance_, WC_BUTTONW, L"Copy Coordinates", BS_PUSHBUTTON | WS_TABSTOP,
-                                 QuickControllerCommands::CopyCoordinates, column3, top + rowStep * 2, buttonWidth, buttonHeight, font_);
+                                 QuickControllerCommands::CopyCoordinates, left, top + rowStep * 2, buttonWidth, buttonHeight, font_);
     loadPresetButton_ = Add(window_, instance_, WC_BUTTONW, L"Load Preset...", BS_PUSHBUTTON | WS_TABSTOP,
-                            QuickControllerCommands::LoadPreset, column4, top + rowStep * 2, buttonWidth, buttonHeight, font_);
+                            QuickControllerCommands::LoadPreset, column2, top + rowStep * 2, buttonWidth, buttonHeight, font_);
 
-    constexpr int wideButton = (buttonWidth * 4 + gap * 3 - gap) / 2;
+    constexpr int finalWidth = (buttonWidth * 4 + gap * 3 - gap * 2) / 3;
+    journeySettingsButton_ = Add(window_, instance_, WC_BUTTONW, L"Journey Settings...", BS_PUSHBUTTON | WS_TABSTOP,
+                                 QuickControllerCommands::JourneySettings, column3, top + rowStep * 2,
+                                 buttonWidth, buttonHeight, font_);
     editButton_ = Add(window_, instance_, WC_BUTTONW, L"Open Editor", BS_PUSHBUTTON | WS_TABSTOP,
-                      QuickControllerCommands::Edit, left, top + rowStep * 3, wideButton, buttonHeight, font_);
+                      QuickControllerCommands::Edit, column4, top + rowStep * 2,
+                      buttonWidth, buttonHeight, font_);
     exitButton_ = Add(window_, instance_, WC_BUTTONW, L"Exit App", BS_PUSHBUTTON | WS_TABSTOP,
-                      QuickControllerCommands::ExitApp, left + wideButton + gap, top + rowStep * 3,
-                      wideButton, buttonHeight, font_);
+                      QuickControllerCommands::ExitApp, left + (finalWidth + gap) * 2, top + rowStep * 3,
+                      finalWidth, buttonHeight, font_);
 
-    SendMessageW(window_, DM_SETDEFID, QuickControllerCommands::ApplySettingsLive, 0);
+    SendMessageW(window_, DM_SETDEFID, QuickControllerCommands::StaticDesktop, 0);
     layout_.Initialise(window_, dpi_, font_, 590, 380);
-    layout_.Focus(applyLiveButton_);
+    layout_.Focus(staticDesktopButton_);
 }
 
 void QuickControllerWindow::Show() {
@@ -121,16 +120,13 @@ void QuickControllerWindow::Hide() {
 
 void QuickControllerWindow::Update(const std::wstring& status, const std::wstring& coordinates,
                                    const std::wstring& resources,
-                                   bool previewZoomMotionEnabled, bool previewColourCyclingEnabled,
-                                   bool desktopZoomMotionEnabled, bool desktopColourCyclingEnabled) {
+                                   bool previewZoomMotionEnabled, bool previewColourCyclingEnabled) {
     if (!window_) return;
     SetWindowTextW(statusLabel_, status.c_str());
     SetWindowTextW(coordinatesLabel_, coordinates.c_str());
     SetWindowTextW(resourcesLabel_, resources.c_str());
     SetWindowTextW(previewZoomButton_, previewZoomMotionEnabled ? L"Stop Preview Zoom" : L"Start Preview Zoom");
     SetWindowTextW(previewColourButton_, previewColourCyclingEnabled ? L"Stop Preview Colours" : L"Start Preview Colours");
-    SetWindowTextW(desktopZoomButton_, desktopZoomMotionEnabled ? L"Stop Desktop Zoom" : L"Start Desktop Zoom");
-    SetWindowTextW(desktopColourButton_, desktopColourCyclingEnabled ? L"Stop Desktop Colours" : L"Start Desktop Colours");
 }
 
 bool QuickControllerWindow::IsVisible() const noexcept {

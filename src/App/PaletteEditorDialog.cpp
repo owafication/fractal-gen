@@ -10,6 +10,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cmath>
+#include <functional>
 #include <iomanip>
 #include <sstream>
 #include <string>
@@ -38,6 +39,14 @@ enum Id : int {
     MoveUpButton,
     MoveDownButton,
     BuiltInButton,
+    FrequencyEdit,
+    GammaEdit,
+    InterpolationCombo,
+    StripeCheck,
+    StripeDensityEdit,
+    StripePhaseEdit,
+    StripeStrengthEdit,
+    StripeStartEdit,
     OkButton,
     CancelButton,
 };
@@ -54,6 +63,8 @@ struct EditorState {
     ResponsiveDialogLayout layout;
     UINT dpi{96};
     std::vector<Colour> colours;
+    Preset originalPreset;
+    std::function<void()> onChanged;
     bool useBuiltIn{false};
     bool accepted{false};
     bool paletteLibraryChanged{false};
@@ -98,6 +109,38 @@ std::wstring ReadText(HWND control) {
     GetWindowTextW(control, text.data(), length + 1);
     text.resize(static_cast<std::size_t>(length));
     return text;
+}
+
+void SetNumber(HWND window, int id, double value) {
+    std::wostringstream stream;
+    stream << std::setprecision(10) << value;
+    SetWindowTextW(GetDlgItem(window, id), stream.str().c_str());
+}
+
+void SetNumber(HWND window, int id, int value) {
+    SetWindowTextW(GetDlgItem(window, id), std::to_wstring(value).c_str());
+}
+
+bool ReadDoubleControl(HWND window, int id, double& value, double minimum, double maximum) {
+    try {
+        const std::wstring input = ReadText(GetDlgItem(window, id));
+        std::size_t consumed = 0;
+        const double parsed = std::stod(input, &consumed);
+        if (consumed != input.size() || !std::isfinite(parsed) || parsed < minimum || parsed > maximum) return false;
+        value = parsed;
+        return true;
+    } catch (...) { return false; }
+}
+
+bool ReadIntControl(HWND window, int id, int& value, int minimum, int maximum) {
+    try {
+        const std::wstring input = ReadText(GetDlgItem(window, id));
+        std::size_t consumed = 0;
+        const int parsed = std::stoi(input, &consumed);
+        if (consumed != input.size() || parsed < minimum || parsed > maximum) return false;
+        value = parsed;
+        return true;
+    } catch (...) { return false; }
 }
 
 COLORREF ToColorRef(const Colour& colour) {
@@ -255,6 +298,40 @@ std::vector<PalettePreset> CustomPaletteLibrary(const EditorState& state) {
         state.savedPalettes.end());
 }
 
+bool ApplyLive(EditorState& state, bool strict) {
+    if (!state.useBuiltIn && state.colours.size() < 2U) return false;
+    double frequency = state.preset->paletteFrequency;
+    double gamma = state.preset->paletteGamma;
+    double stripeDensity = state.preset->equation.stripeDensity;
+    double stripePhase = state.preset->equation.stripePhase;
+    double stripeStrength = state.preset->equation.stripeStrength;
+    int stripeStart = state.preset->equation.stripeStartIteration;
+    const bool valid = ReadDoubleControl(state.window, FrequencyEdit, frequency, 0.05, 256.0) &&
+        ReadDoubleControl(state.window, GammaEdit, gamma, 0.05, 8.0) &&
+        ReadDoubleControl(state.window, StripeDensityEdit, stripeDensity, 0.1, 128.0) &&
+        ReadDoubleControl(state.window, StripePhaseEdit, stripePhase, -1000.0, 1000.0) &&
+        ReadDoubleControl(state.window, StripeStrengthEdit, stripeStrength, 0.0, 2.0) &&
+        ReadIntControl(state.window, StripeStartEdit, stripeStart, 0, 4096);
+    if (!valid && strict) return false;
+    state.preset->paletteFrequency = frequency;
+    state.preset->paletteGamma = gamma;
+    const int interpolationIndex = static_cast<int>(SendMessageW(
+        GetDlgItem(state.window, InterpolationCombo), CB_GETCURSEL, 0, 0));
+    state.preset->paletteInterpolation = interpolationIndex == 1
+        ? PaletteInterpolation::Smoothstep : PaletteInterpolation::Linear;
+    state.preset->equation.stripeAverageEnabled = SendMessageW(
+        GetDlgItem(state.window, StripeCheck), BM_GETCHECK, 0, 0) == BST_CHECKED;
+    state.preset->equation.stripeDensity = stripeDensity;
+    state.preset->equation.stripePhase = stripePhase;
+    state.preset->equation.stripeStrength = stripeStrength;
+    state.preset->equation.stripeStartIteration = stripeStart;
+    state.preset->customPaletteColours = state.useBuiltIn ? std::vector<Colour>{} : state.colours;
+    ValidateAndNormalise(*state.preset);
+    if (state.paletteLibraryChanged) *state.destinationPalettes = CustomPaletteLibrary(state);
+    if (state.onChanged) state.onChanged();
+    return true;
+}
+
 void SavePalettePreset(EditorState& state) {
     if (state.colours.size() < 2) {
         MessageBoxW(state.window, L"A saved palette needs at least two colours.", L"Palette", MB_OK | MB_ICONWARNING);
@@ -377,7 +454,7 @@ LRESULT CALLBACK Procedure(HWND window, UINT message, WPARAM wParam, LPARAM lPar
         Add(window, state->instance, WC_STATICW, L"", SS_LEFT, InfoLabel, 18, 88, 650, 24, state->font);
         HWND list = Add(window, state->instance, WC_LISTBOXW, L"",
             LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | LBS_OWNERDRAWFIXED | LBS_HASSTRINGS | WS_VSCROLL | WS_TABSTOP,
-            ColourList, 18, 116, 430, 350, state->font, WS_EX_CLIENTEDGE);
+            ColourList, 18, 116, 430, 560, state->font, WS_EX_CLIENTEDGE);
         SetWindowTextW(list, L"Palette colour stops");
         SendMessageW(list, LB_SETITEMHEIGHT, 0, ScaleDialogMetric(28, state->dpi));
         Add(window, state->instance, WC_BUTTONW, L"Add Colour...", BS_PUSHBUTTON | WS_TABSTOP, AddColourButton, 464, 116, 150, 30, state->font);
@@ -386,15 +463,59 @@ LRESULT CALLBACK Procedure(HWND window, UINT message, WPARAM wParam, LPARAM lPar
         Add(window, state->instance, WC_BUTTONW, L"Move Up", BS_PUSHBUTTON | WS_TABSTOP, MoveUpButton, 464, 246, 150, 30, state->font);
         Add(window, state->instance, WC_BUTTONW, L"Move Down", BS_PUSHBUTTON | WS_TABSTOP, MoveDownButton, 464, 284, 150, 30, state->font);
         Add(window, state->instance, WC_BUTTONW, L"Use Built-in Palette", BS_PUSHBUTTON | WS_TABSTOP, BuiltInButton, 464, 338, 150, 42, state->font);
-        Add(window, state->instance, WC_STATICW,
-            L"Colour stops interpolate in list order and wrap smoothly back to the first colour.",
-            SS_LEFT, 0, 464, 392, 190, 64, state->font);
-        Add(window, state->instance, WC_BUTTONW, L"&OK", BS_DEFPUSHBUTTON | WS_TABSTOP, OkButton, 422, 484, 105, 32, state->font);
-        Add(window, state->instance, WC_BUTTONW, L"&Cancel", BS_PUSHBUTTON | WS_TABSTOP, CancelButton, 537, 484, 105, 32, state->font);
+        Add(window, state->instance, WC_STATICW, L"Colour mapping", SS_LEFT, 0,
+            464, 392, 190, 24, state->font);
+        Add(window, state->instance, WC_STATICW, L"Frequency", SS_LEFT, 0,
+            464, 422, 94, 24, state->font);
+        Add(window, state->instance, WC_EDITW, L"", ES_AUTOHSCROLL | WS_TABSTOP,
+            FrequencyEdit, 566, 418, 82, 27, state->font, WS_EX_CLIENTEDGE);
+        Add(window, state->instance, WC_STATICW, L"Gamma", SS_LEFT, 0,
+            464, 454, 94, 24, state->font);
+        Add(window, state->instance, WC_EDITW, L"", ES_AUTOHSCROLL | WS_TABSTOP,
+            GammaEdit, 566, 450, 82, 27, state->font, WS_EX_CLIENTEDGE);
+        Add(window, state->instance, WC_STATICW, L"Interpolation", SS_LEFT, 0,
+            464, 486, 94, 24, state->font);
+        HWND interpolation = Add(window, state->instance, WC_COMBOBOXW, L"",
+            CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, InterpolationCombo,
+            566, 482, 82, 120, state->font);
+        SendMessageW(interpolation, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Linear"));
+        SendMessageW(interpolation, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Smooth"));
+        Add(window, state->instance, WC_BUTTONW, L"Stripe-average texture",
+            BS_AUTOCHECKBOX | WS_TABSTOP, StripeCheck, 464, 520, 184, 26, state->font);
+        Add(window, state->instance, WC_STATICW, L"Density", SS_LEFT, 0,
+            464, 554, 94, 24, state->font);
+        Add(window, state->instance, WC_EDITW, L"", ES_AUTOHSCROLL | WS_TABSTOP,
+            StripeDensityEdit, 566, 550, 82, 27, state->font, WS_EX_CLIENTEDGE);
+        Add(window, state->instance, WC_STATICW, L"Phase", SS_LEFT, 0,
+            464, 586, 94, 24, state->font);
+        Add(window, state->instance, WC_EDITW, L"", ES_AUTOHSCROLL | WS_TABSTOP,
+            StripePhaseEdit, 566, 582, 82, 27, state->font, WS_EX_CLIENTEDGE);
+        Add(window, state->instance, WC_STATICW, L"Strength", SS_LEFT, 0,
+            464, 618, 94, 24, state->font);
+        Add(window, state->instance, WC_EDITW, L"", ES_AUTOHSCROLL | WS_TABSTOP,
+            StripeStrengthEdit, 566, 614, 82, 27, state->font, WS_EX_CLIENTEDGE);
+        Add(window, state->instance, WC_STATICW, L"Start iteration", SS_LEFT, 0,
+            464, 650, 94, 24, state->font);
+        Add(window, state->instance, WC_EDITW, L"", ES_AUTOHSCROLL | WS_TABSTOP,
+            StripeStartEdit, 566, 646, 82, 27, state->font, WS_EX_CLIENTEDGE);
+        Add(window, state->instance, WC_BUTTONW, L"&OK", BS_DEFPUSHBUTTON | WS_TABSTOP,
+            OkButton, 422, 690, 105, 32, state->font);
+        Add(window, state->instance, WC_BUTTONW, L"&Cancel", BS_PUSHBUTTON | WS_TABSTOP,
+            CancelButton, 537, 690, 105, 32, state->font);
+        SetNumber(window, FrequencyEdit, state->preset->paletteFrequency);
+        SetNumber(window, GammaEdit, state->preset->paletteGamma);
+        SendMessageW(interpolation, CB_SETCURSEL,
+                     static_cast<WPARAM>(state->preset->paletteInterpolation), 0);
+        SendMessageW(GetDlgItem(window, StripeCheck), BM_SETCHECK,
+                     state->preset->equation.stripeAverageEnabled ? BST_CHECKED : BST_UNCHECKED, 0);
+        SetNumber(window, StripeDensityEdit, state->preset->equation.stripeDensity);
+        SetNumber(window, StripePhaseEdit, state->preset->equation.stripePhase);
+        SetNumber(window, StripeStrengthEdit, state->preset->equation.stripeStrength);
+        SetNumber(window, StripeStartEdit, state->preset->equation.stripeStartIteration);
         RefreshSavedPaletteCombo(*state);
         RefreshList(*state);
         SendMessageW(window, DM_SETDEFID, OkButton, 0);
-        state->layout.Initialise(window, state->dpi, state->font, 520, 400);
+        state->layout.Initialise(window, state->dpi, state->font, 520, 600);
         state->layout.Focus(GetDlgItem(window, SavedPaletteCombo));
         return 0;
     }
@@ -430,33 +551,41 @@ LRESULT CALLBACK Procedure(HWND window, UINT message, WPARAM wParam, LPARAM lPar
     if (message == WM_COMMAND) {
         const int id = LOWORD(wParam);
         const int notification = HIWORD(wParam);
-        if (id == AddColourButton) AddColour(*state);
-        else if (id == EditColourButton || (id == ColourList && notification == LBN_DBLCLK)) EditColour(*state);
-        else if (id == RemoveColourButton) RemoveColour(*state);
-        else if (id == MoveUpButton) Move(*state, -1);
-        else if (id == MoveDownButton) Move(*state, 1);
-        else if (id == LoadSavedButton || (id == SavedPaletteCombo && notification == CBN_SELCHANGE)) SelectSavedPalette(*state);
-        else if (id == SaveSavedButton) SavePalettePreset(*state);
-        else if (id == DeleteSavedButton) DeletePalettePreset(*state);
+        bool changed = false;
+        if (id == AddColourButton) { AddColour(*state); changed = true; }
+        else if (id == EditColourButton || (id == ColourList && notification == LBN_DBLCLK)) { EditColour(*state); changed = true; }
+        else if (id == RemoveColourButton) { RemoveColour(*state); changed = true; }
+        else if (id == MoveUpButton) { Move(*state, -1); changed = true; }
+        else if (id == MoveDownButton) { Move(*state, 1); changed = true; }
+        else if (id == LoadSavedButton || (id == SavedPaletteCombo && notification == CBN_SELCHANGE)) {
+            SelectSavedPalette(*state); changed = true;
+        }
+        else if (id == SaveSavedButton) { SavePalettePreset(*state); changed = true; }
+        else if (id == DeleteSavedButton) { DeletePalettePreset(*state); changed = true; }
         else if (id == BuiltInButton) {
             state->useBuiltIn = true;
             state->colours = PalettePreviewColours(state->preset->palette);
             SetWindowTextW(GetDlgItem(state->window, PaletteNameEdit), L"");
             SendMessageW(GetDlgItem(state->window, SavedPaletteCombo), CB_SETCURSEL, static_cast<WPARAM>(-1), 0);
             RefreshList(*state);
+            changed = true;
         } else if (id == OkButton) {
-            if (!state->useBuiltIn && state->colours.size() < 2) {
-                MessageBoxW(window, L"Add at least two colours or choose Use Built-in Palette.", L"Palette", MB_OK | MB_ICONWARNING);
+            if (!ApplyLive(*state, true)) {
+                MessageBoxW(window,
+                    L"Check the palette and colour mapping values. Frequency: 0.05-256, gamma: 0.05-8, density: 0.1-128, strength: 0-2, start: 0-4096.",
+                    L"Palette Mapping", MB_OK | MB_ICONWARNING);
                 return 0;
             }
-            state->preset->customPaletteColours = state->useBuiltIn ? std::vector<Colour>{} : state->colours;
-            ValidateAndNormalise(*state->preset);
             *state->destinationPalettes = CustomPaletteLibrary(*state);
             state->accepted = true;
             DestroyWindow(window);
         } else if (id == CancelButton) {
             DestroyWindow(window);
+        } else if ((notification == EN_CHANGE && id != PaletteNameEdit) ||
+                   notification == CBN_SELCHANGE || notification == BN_CLICKED) {
+            changed = true;
         }
+        if (changed) (void)ApplyLive(*state, false);
         return 0;
     }
     if (message == WM_CLOSE) {
@@ -466,12 +595,15 @@ LRESULT CALLBACK Procedure(HWND window, UINT message, WPARAM wParam, LPARAM lPar
     if (message == WM_DESTROY) {
         RememberDialogPlacement(window, kPaletteEditorClass, state->dpi);
         state->layout.Shutdown();
-        if (state->paletteLibraryChanged) *state->destinationPalettes = CustomPaletteLibrary(*state);
+        if (!state->accepted) {
+            *state->preset = state->originalPreset;
+            if (state->onChanged) state->onChanged();
+        } else if (state->paletteLibraryChanged) {
+            *state->destinationPalettes = CustomPaletteLibrary(*state);
+        }
         if (state->font) DeleteObject(state->font);
         state->font = nullptr;
         state->done = true;
-        EnableWindow(state->owner, TRUE);
-        SetForegroundWindow(state->owner);
         return 0;
     }
     return DefWindowProcW(window, message, wParam, lParam);
@@ -480,7 +612,8 @@ LRESULT CALLBACK Procedure(HWND window, UINT message, WPARAM wParam, LPARAM lPar
 } // namespace
 
 bool PaletteEditorDialog::Show(HWND owner, HINSTANCE instance, Preset& preset,
-                               std::vector<PalettePreset>& savedPalettes) {
+                               std::vector<PalettePreset>& savedPalettes,
+                               std::function<void()> onChanged) {
     WNDCLASSEXW windowClass{};
     windowClass.cbSize = sizeof(windowClass);
     windowClass.lpfnWndProc = Procedure;
@@ -494,6 +627,8 @@ bool PaletteEditorDialog::Show(HWND owner, HINSTANCE instance, Preset& preset,
     state.owner = owner;
     state.instance = instance;
     state.preset = &preset;
+    state.originalPreset = preset;
+    state.onChanged = std::move(onChanged);
     state.destinationPalettes = &savedPalettes;
     state.savedPalettes = BuiltInPalettePresets();
     state.builtInPaletteCount = state.savedPalettes.size();
@@ -502,15 +637,14 @@ bool PaletteEditorDialog::Show(HWND owner, HINSTANCE instance, Preset& preset,
     state.colours = state.useBuiltIn ? PalettePreviewColours(preset.palette) : preset.customPaletteColours;
 
     state.dpi = DialogDpi(owner);
-    const RECT dialogRect = ResponsiveDialogRect(owner, 682, 565, state.dpi, kPaletteEditorClass);
-    HWND window = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_CONTROLPARENT, kPaletteEditorClass, L"Custom Palette Editor",
-                                  WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_MAXIMIZEBOX |
-                                  WS_POPUP | WS_VISIBLE | WS_VSCROLL | WS_HSCROLL,
+    const RECT dialogRect = ResponsiveDialogRect(owner, 710, 770, state.dpi, kPaletteEditorClass);
+    HWND window = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_CONTROLPARENT, kPaletteEditorClass, L"Custom Palette Editor",
+                                  WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_MAXIMIZEBOX |
+                                  WS_VISIBLE | WS_VSCROLL | WS_HSCROLL,
                                   dialogRect.left, dialogRect.top,
                                   dialogRect.right - dialogRect.left, dialogRect.bottom - dialogRect.top,
                                   owner, nullptr, instance, &state);
     if (!window) return false;
-    EnableWindow(owner, FALSE);
 
     MSG message{};
     while (!state.done && GetMessageW(&message, nullptr, 0, 0) > 0) {
@@ -519,7 +653,10 @@ bool PaletteEditorDialog::Show(HWND owner, HINSTANCE instance, Preset& preset,
             DispatchMessageW(&message);
         }
     }
-    return state.accepted || state.paletteLibraryChanged;
+    // Saving a library entry does not accept the editor. Only OK commits the
+    // candidate preset and library together; Cancel must leave no replacement
+    // for AppWindow to record or persist.
+    return state.accepted;
 }
 #endif
 

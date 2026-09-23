@@ -11,6 +11,8 @@ namespace mw {
 struct LoadSettingsResult {
     AppSettings settings;
     bool usedDefaults{false};
+    bool migrated{false};
+    std::filesystem::path migrationBackupPath;
     std::string warning;
 };
 

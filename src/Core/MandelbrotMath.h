@@ -14,11 +14,14 @@ struct EscapeResult {
     int rootIndex{-1};
     double orbitTrapDistance{1.0e30};
     double distanceEstimate{0.0};
+    double stripeAverage{0.5};
 };
 
 EscapeResult CalculateEscape(double real, double imaginary, int maximumIterations);
 EscapeResult CalculateEscape(double real, double imaginary, int maximumIterations,
                              const EquationSettings& equation, double timeSeconds = 0.0);
+[[nodiscard]] bool SupportsConjugateDistanceEstimation(
+    const EquationSettings& equation) noexcept;
 bool IsInterestingMandelbrotTarget(double real, double imaginary, int maximumIterations);
 bool IsInterestingFractalTarget(double real, double imaginary, int maximumIterations,
                                 const EquationSettings& equation);

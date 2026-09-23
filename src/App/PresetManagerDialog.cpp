@@ -98,6 +98,15 @@ void Finish(DialogState& state, PresetManagerAction action) {
     DestroyWindow(state.window);
 }
 
+void UpdateActionState(DialogState& state) {
+    const int selection = static_cast<int>(SendMessageW(
+        GetDlgItem(state.window, PresetList), LB_GETCURSEL, 0, 0));
+    const bool custom = selection >= 0 && selection < static_cast<int>(state.presets->size()) &&
+                        !(*state.presets)[static_cast<std::size_t>(selection)].builtIn;
+    EnableWindow(GetDlgItem(state.window, UpdateButton), custom ? TRUE : FALSE);
+    EnableWindow(GetDlgItem(state.window, DeleteButton), custom ? TRUE : FALSE);
+}
+
 LRESULT CALLBACK Procedure(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
     auto* state = reinterpret_cast<DialogState*>(GetWindowLongPtrW(window, GWLP_USERDATA));
     if (message == WM_NCCREATE) {
@@ -149,6 +158,7 @@ LRESULT CALLBACK Procedure(HWND window, UINT message, WPARAM wParam, LPARAM lPar
         button(ExportButton, L"Export Selected...");
         button(CloseButton, L"&Close");
         SendMessageW(window, DM_SETDEFID, LoadButton, 0);
+        UpdateActionState(*state);
         state->layout.Initialise(window, state->dpi, state->font, 620, 430);
         state->layout.Focus(GetDlgItem(window, PresetList));
         return 0;
@@ -179,7 +189,8 @@ LRESULT CALLBACK Procedure(HWND window, UINT message, WPARAM wParam, LPARAM lPar
     }
     case WM_COMMAND: {
         const int id = LOWORD(wParam);
-        if (id == PresetList && HIWORD(wParam) == LBN_DBLCLK) Finish(*state, PresetManagerAction::Load);
+        if (id == PresetList && HIWORD(wParam) == LBN_SELCHANGE) UpdateActionState(*state);
+        else if (id == PresetList && HIWORD(wParam) == LBN_DBLCLK) Finish(*state, PresetManagerAction::Load);
         else if (id == LoadButton) Finish(*state, PresetManagerAction::Load);
         else if (id == SaveNewButton) {
             const std::string name = ReadSaveAsName(window);
@@ -197,8 +208,10 @@ LRESULT CALLBACK Procedure(HWND window, UINT message, WPARAM wParam, LPARAM lPar
             }
             Finish(*state, PresetManagerAction::SaveNew);
         }
-        else if (id == UpdateButton) Finish(*state, PresetManagerAction::Update);
-        else if (id == DeleteButton) Finish(*state, PresetManagerAction::Delete);
+        else if (id == UpdateButton && IsWindowEnabled(GetDlgItem(window, UpdateButton)))
+            Finish(*state, PresetManagerAction::Update);
+        else if (id == DeleteButton && IsWindowEnabled(GetDlgItem(window, DeleteButton)))
+            Finish(*state, PresetManagerAction::Delete);
         else if (id == RestoreButton) Finish(*state, PresetManagerAction::RestoreBuiltIns);
         else if (id == ImportButton) Finish(*state, PresetManagerAction::Import);
         else if (id == ExportButton) Finish(*state, PresetManagerAction::Export);

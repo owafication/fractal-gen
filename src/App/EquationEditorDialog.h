@@ -7,6 +7,7 @@
 #endif
 
 #include <vector>
+#include <functional>
 
 namespace mw {
 
@@ -14,7 +15,8 @@ class EquationEditorDialog {
 public:
 #ifdef _WIN32
     static bool Show(HWND owner, HINSTANCE instance, Preset& preset,
-                     std::vector<EquationPreset>& savedPresets);
+                     std::vector<EquationPreset>& savedPresets,
+                     std::function<void()> onChanged = {});
 #endif
 };
 

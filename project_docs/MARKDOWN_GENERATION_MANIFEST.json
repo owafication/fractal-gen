@@ -1,0 +1,53 @@
+{
+  "generated_at": "2026-07-27",
+  "source_archive": "Mandelbrot-Live-Wallpaper-1.13.1-journey-build-fix-source.zip",
+  "mode": "File generation",
+  "changed_markdown_files": [
+    "AGENTS.md",
+    "CHANGELOG.md",
+    "CONTRIBUTING.md",
+    "README.md",
+    "docs/ARCHITECTURE.md",
+    "docs/FRACTAL-STYLE-BUILD-PLAN.md",
+    "docs/PHASE-COMPLETION.md",
+    "docs/PRIVACY-SECURITY.md",
+    "docs/TESTING.md",
+    "docs/WINDOWS-INTEGRATION.md",
+    "docs/architecture/PROJECT-STATE-AND-PARAMETERS.md",
+    "docs/architecture/RENDERING-AND-EXPORT-CONTRACTS.md",
+    "docs/features/ANIMATION-TRACKS-PLAN.md",
+    "docs/features/FRACTAL-SCOUT-STATUS.md",
+    "docs/features/OFFLINE-EXPORT-PLAN.md",
+    "docs/features/UNDO-REDO-PLAN.md",
+    "docs/roadmaps/INTEGRATED-CREATIVE-ROADMAP.md",
+    "docs/roadmaps/ROADMAP-RECOMMENDATIONS-2026-07-27.md",
+    "docs/testing/VISUAL-REGRESSION.md",
+    "project_docs/DATA_AND_PERSISTENCE.md",
+    "project_docs/DEBUGGING_AND_MAINTENANCE.md",
+    "project_docs/DECISIONS_AND_CHANGE_HISTORY.md",
+    "project_docs/DELIVERY_REPORT.md",
+    "project_docs/IMPLEMENTATION_PLAN.md",
+    "project_docs/PROJECT_FOUNDATION.md",
+    "project_docs/PROJECT_INDEX.md",
+    "project_docs/PROJECT_SETTINGS.md",
+    "project_docs/REPOSITORY_AND_VERSIONING.md",
+    "project_docs/SECURITY_PRIVACY_AND_RISK.md",
+    "project_docs/TRACEABILITY.md",
+    "project_docs/UI_WORKFLOWS_AND_ROUTES.md",
+    "project_docs/VALIDATION_AND_EVIDENCE.md"
+  ],
+  "agents_characters": 3068,
+  "project_settings_characters": 3682,
+  "checks": [
+    "required paths exist",
+    "new canonical internal links resolve",
+    "character limits pass"
+  ],
+  "not_run": [
+    "build",
+    "tests",
+    "runtime",
+    "packaging scripts",
+    "git"
+  ]
+}

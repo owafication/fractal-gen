@@ -11,7 +11,9 @@ namespace mw {
 class HighResRenderDialog {
 public:
 #ifdef _WIN32
-    static void Show(HWND owner, HINSTANCE instance, const Preset& snapshot, const PerformanceSettings& performance);
+    static void Show(HWND owner, HINSTANCE instance, const Preset& snapshot,
+                     const PerformanceSettings& performance,
+                     const StaticWallpaperSettings& outputSettings);
 #endif
 };
 

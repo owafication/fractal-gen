@@ -7,8 +7,29 @@
 
 #include <array>
 #include <cstdlib>
+#include <optional>
+#include <vector>
 
 namespace mw {
+
+namespace {
+
+std::optional<std::filesystem::path> AppDataOverride() {
+#ifdef _WIN32
+    const DWORD required = GetEnvironmentVariableW(L"MW_APPDATA_DIR", nullptr, 0);
+    if (required <= 1) return std::nullopt;
+    std::vector<wchar_t> buffer(required);
+    const DWORD length = GetEnvironmentVariableW(L"MW_APPDATA_DIR", buffer.data(), required);
+    if (length == 0 || length >= required) return std::nullopt;
+    return std::filesystem::path(std::wstring(buffer.data(), length));
+#else
+    const char* raw = std::getenv("MW_APPDATA_DIR");
+    if (raw == nullptr || *raw == '\0') return std::nullopt;
+    return std::filesystem::path(raw);
+#endif
+}
+
+} // namespace
 
 std::filesystem::path Paths::ExecutablePath() {
 #ifdef _WIN32
@@ -27,6 +48,7 @@ std::filesystem::path Paths::ExecutableDirectory() {
 }
 
 std::filesystem::path Paths::AppDataDirectory() {
+    if (const auto overridePath = AppDataOverride()) return *overridePath;
 #ifdef _WIN32
     PWSTR rawPath = nullptr;
     if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_LocalAppData, KF_FLAG_CREATE, nullptr, &rawPath)) && rawPath) {

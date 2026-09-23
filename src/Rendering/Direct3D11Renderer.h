@@ -23,11 +23,15 @@ public:
     Direct3D11Renderer& operator=(const Direct3D11Renderer&) = delete;
 
 #ifdef _WIN32
-    bool Initialise(HWND window, std::string& error);
+    // WARP is test-only; production callers retain the hardware default.
+    bool Initialise(HWND window, std::string& error, bool useWarp = false);
     bool Render(const std::vector<RenderRegion>& regions, const RenderOptions& options,
                 std::string& error);
     bool CapturePixels(std::vector<std::uint32_t>& pixels, int& width, int& height,
                        std::string& error);
+    // Diagnostic-only readback for the deterministic WARP fixture.  This verifies
+    // the immutable reference-orbit texture transport; it is not a shader-precision claim.
+    bool CaptureReferenceOrbitTexture(ReferenceOrbit& orbit, std::string& error);
     [[nodiscard]] int MaximumRenderDimension() const noexcept;
     void Resize(int width, int height);
     void Shutdown();
@@ -61,8 +65,15 @@ private:
         Float4 flags1;
         Float4 flags2;
         Float4 flags3;
+        Float4 paletteControls;
+        Float4 stripeControls;
+        Float4 distanceControls;
     };
-    struct PostConstants { Float4 texelGlow; };
+    struct PostConstants {
+        Float4 texelDirection;
+        Float4 bloom;
+        Float4 pass;
+    };
 
     bool CreateDeviceAndSwapChain(std::string& error);
     bool BuildShaders(std::string& error);
@@ -86,6 +97,7 @@ private:
     std::string DeviceRemovedError(HRESULT result) const;
 
     HWND window_{nullptr};
+    bool useWarp_{false};
     int width_{1};
     int height_{1};
     int backBufferWidth_{0};
@@ -104,6 +116,9 @@ private:
     Microsoft::WRL::ComPtr<ID3D11Texture2D> renderTexture_;
     Microsoft::WRL::ComPtr<ID3D11RenderTargetView> renderTargetView_;
     Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> renderShaderView_;
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> blurTexture_;
+    Microsoft::WRL::ComPtr<ID3D11RenderTargetView> blurTargetView_;
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> blurShaderView_;
     Microsoft::WRL::ComPtr<ID3D11VertexShader> fullScreenVertexShader_;
     Microsoft::WRL::ComPtr<ID3D11PixelShader> fractalPixelShader_;
     Microsoft::WRL::ComPtr<ID3D11PixelShader> postPixelShader_;
@@ -121,6 +136,9 @@ private:
     std::string referenceOrbitKey_;
     int referenceOrbitLength_{0};
     float postProcessGlowStrength_{0.0F};
+    float postProcessBloomThreshold_{0.22F};
+    float postProcessBloomSoftKnee_{0.0F};
+    int postProcessBloomRadius_{1};
 #endif
 
     bool ready_{false};

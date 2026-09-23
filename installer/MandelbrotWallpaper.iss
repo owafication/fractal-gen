@@ -6,12 +6,13 @@
 #endif
 
 #define AppName "Mandelbrot Live Wallpaper"
-#define AppVersion "1.11.7"
+#define AppVersion "1.13.1"
 #define AppPublisher "Mandelbrot Live Wallpaper contributors"
 #define AppExeName "MandelbrotWallpaper.exe"
 
 [Setup]
 AppId={{20F1F29B-52A3-4BEE-AB7E-BCE7F6100C39}
+AppMutex=Local\MandelbrotLiveWallpaper.SingleInstance
 AppName={#AppName}
 AppVersion={#AppVersion}
 AppPublisher={#AppPublisher}
@@ -29,7 +30,7 @@ ArchitecturesInstallIn64BitMode=x64compatible
 UninstallDisplayIcon={app}\{#AppExeName}
 SetupIconFile=..\assets\icons\mandelbrot.ico
 LicenseFile=..\LICENSE
-CloseApplications=yes
+CloseApplications=no
 RestartApplications=no
 VersionInfoVersion={#AppVersion}
 VersionInfoDescription={#AppName} Setup
@@ -38,6 +39,7 @@ VersionInfoDescription={#AppName} Setup
 Source: "{#SourceExe}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\README.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\THIRD_PARTY_NOTICES.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\docs\*"; DestDir: "{app}\docs"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "..\assets\presets\*"; DestDir: "{app}\assets\presets"; Flags: ignoreversion recursesubdirs createallsubdirs
 
@@ -51,8 +53,5 @@ Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription:
 [Run]
 Filename: "{app}\{#AppExeName}"; Description: "Launch {#AppName}"; Flags: nowait postinstall skipifsilent
 
-[UninstallRun]
-Filename: "{cmd}"; Parameters: "/C taskkill /IM {#AppExeName} /T /F >NUL 2>&1"; Flags: runhidden; RunOnceId: "StopWallpaperProcess"
-
-[UninstallDelete]
-Type: filesandordirs; Name: "{app}"
+; Inno removes only files recorded by this installation. Preserve user-created
+; files and never terminate an application by its global executable name.

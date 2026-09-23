@@ -1,6 +1,8 @@
 #include "Rendering/Direct3D11Renderer.h"
 
 #include "Infrastructure/Logger.h"
+#include "Core/MandelbrotMath.h"
+#include "Core/Precision/PrecisionPlanner.h"
 
 #ifdef _WIN32
 #include <d3dcompiler.h>
@@ -43,13 +45,17 @@ cbuffer FractalConstants : register(b0) {
     float4 cFlags1;
     float4 cFlags2;
     float4 cFlags3;
+    float4 cPaletteControls;
+    float4 cStripeControls;
+    float4 cDistanceControls;
 };
 
-cbuffer PostConstants : register(b1) { float4 cTexelGlow; };
+cbuffer PostConstants : register(b1) { float4 cTexelDirection; float4 cBloom; float4 cPostPass; };
 Texture1D<float4> CustomPalette : register(t0);
 Texture1D<float4> ReferenceOrbitReal : register(t1);
 Texture1D<float4> ReferenceOrbitImaginary : register(t2);
 Texture2D<float4> FrameTexture : register(t3);
+Texture2D<float4> OriginalTexture : register(t4);
 SamplerState LinearWrap : register(s0);
 SamplerState PointClamp : register(s1);
 
@@ -75,6 +81,7 @@ float2 animatedCoeff(float2 base,float phase){if(cAnimation.z<0.5)return base;fl
 float2 principalRoot(float2 value,int degree){float mag=pow(max(length(value),1.0e-30),1.0/max((float)degree,1.0));float angle=atan2(value.y,value.x)/max((float)degree,1.0);return mag*float2(cos(angle),sin(angle));}
 float2 initialValue(float2 pixel,float2 c){if(cFlags1.z>0.5)return pixel;int mode=(int)cFlags1.y;if(mode==1)return cInitialJulia.xy;if(mode==2)return c;if(mode==3&&(int)cIntegers0.w>0&&length(cIterationReciprocal.zw)>1.0e-8&&length(cEquationQuadraticLinear.xy)>1.0e-8){float2 rhs=cdiv((float)((int)cIntegers0.w)*cIterationReciprocal.zw,(float)((int)cIntegers0.y)*cEquationQuadraticLinear.xy);return principalRoot(rhs,(int)cIntegers0.y+(int)cIntegers0.w);}return float2(0.0,0.0);}
 float trapDistance(float2 z){float2 r=z-cOrbit.xy;int trap=(int)cFlags2.z;if(trap==1)return min(abs(r.x),abs(r.y));if(trap==2)return abs(length(r)-cOrbit.z);return length(r);}
+float jacobianStretch(float2 derivativeX,float2 derivativeY){float trace=dot(derivativeX,derivativeX)+dot(derivativeY,derivativeY);float determinant=derivativeX.x*derivativeY.y-derivativeY.x*derivativeX.y;float discriminant=max(trace*trace-4.0*determinant*determinant,0.0);return sqrt(max(0.5*(trace+sqrt(discriminant)),0.0));}
 
 float2 twoSum(float a,float b){float s=a+b;float bb=s-a;return float2(s,(a-(s-bb))+(b-bb));}
 float2 quickTwoSum(float a,float b){float s=a+b;return float2(s,b-(s-a));}
@@ -85,27 +92,28 @@ float2 ddMul(float2 a,float2 b){float2 as=splitFloat(a.x);float2 bs=splitFloat(b
 float4 cddAdd(float4 a,float4 b){float2 r=ddAdd(a.xz,b.xz);float2 i=ddAdd(a.yw,b.yw);return float4(r.x,i.x,r.y,i.y);}
 float4 cddMul(float4 a,float4 b){float2 r=ddSub(ddMul(a.xz,b.xz),ddMul(a.yw,b.yw));float2 i=ddAdd(ddMul(a.xz,b.yw),ddMul(a.yw,b.xz));return float4(r.x,i.x,r.y,i.y);}
 float4 cddFromVec2(float2 a){return float4(a.x,a.y,0.0,0.0);}
+float4 cddConj(float4 a){return float4(a.x,-a.y,a.z,-a.w);}
 float4 cddScale(float4 a,float scale){float2 r=ddMul(a.xz,float2(scale,0.0));float2 i=ddMul(a.yw,float2(scale,0.0));return float4(r.x,i.x,r.y,i.y);}
 float2 cddValue(float4 a){return float2(a.x+a.z,a.y+a.w);}
 
 float3 hsv2rgb(float3 c){float3 p=abs(frac(c.xxx+float3(0.0,2.0/3.0,1.0/3.0))*6.0-3.0);return c.z*lerp(float3(1.0,1.0,1.0),saturate(p-1.0),c.y);}
 float3 palette(float t){t=frac(t);if(cFlags3.x>0.5)return CustomPalette.Sample(LinearWrap,t).rgb;int p=(int)cFlags2.w;if(p==0)return hsv2rgb(float3(t,0.82,1.0));if(p==1)return lerp(float3(0.0,0.015,0.08),float3(0.0,0.65,1.0),pow(t,0.7));if(p==2)return lerp(float3(0.06,0.0,0.0),float3(1.0,0.8,0.05),pow(t,1.5));if(p==3)return lerp(float3(0.02,0.0,0.08),float3(1.0,0.1,0.9),0.5+0.5*sin(t*6.28318));if(p==4)return lerp(float3(0.0,0.0,0.0),float3(0.1,1.0,0.25),pow(t,0.8));if(p==5)return lerp(float3(0.03,0.01,0.0),float3(1.0,0.72,0.12),pow(t,0.65));if(p==6)return lerp(float3(0.01,0.08,0.12),float3(0.75,0.98,1.0),pow(t,0.75));if(p==7)return float3(t,t,t);if(p==8)return 0.62+0.38*cos(6.28318*(float3(0.0,0.33,0.67)+t));return frac(t*8.0)>=0.5?float3(1.0,1.0,1.0):float3(0.01,0.01,0.01);}
-float3 adjustColour(float3 colour){float l=dot(colour,float3(0.2126,0.7152,0.0722));colour=lerp(float3(l,l,l),colour,cColour.w);colour=(colour-0.5)*cColour.z+0.5;return saturate(colour*cColour.y);}
-float3 finishEscape(int iteration,float magnitudeSquared,float trap,float distanceEstimate){int maxIterations=(int)cIntegers0.x;if(iteration>=maxIterations)return cInterior.rgb;float smoothIteration=(float)iteration;if(cFlags3.y>0.5&&magnitudeSquared>1.0){float lm=0.5*log(max(magnitudeSquared,1.000001));if(lm>0.0){float correction=log(max(lm,0.000001))/log(max((float)((int)cIntegers0.y),2.0));if(correction==correction&&abs(correction)<3.4e38)smoothIteration=(float)iteration+1.0-correction;}}float t=smoothIteration/max((float)maxIterations,1.0)*8.0+cColour.x;float feature=0.0;int method=(int)cFlags2.y;if(method==1){t=-log(max(trap,1.0e-8))*0.32+cColour.x;feature=exp(-trap*18.0);}else if(method==2&&distanceEstimate>0.0){t=-log(max(distanceEstimate,1.0e-10))*0.22+cColour.x;feature=exp(-distanceEstimate*80.0);}float3 colour=lerp(cBackground.rgb,palette(t),0.96);float depth=1.0+cEffects.y*(1.0-smoothIteration/max((float)maxIterations,1.0))*0.45;colour*=depth;colour+=palette(t+0.08)*feature*cEffects.x*0.6;return adjustColour(colour);}
-float3 finishNewton(int iteration,float root,float trap){if(root<0.0)return cInterior.rgb;float base=root/max(cFlags2.x,1.0);float shade=1.0-(float)iteration/max(cIntegers0.x,1.0);float3 colour=palette(base+cColour.x+shade*0.08);float glow=exp(-trap*18.0)*cEffects.x;colour=colour*(0.45+0.75*shade)+palette(base+0.12)*glow;return adjustColour(colour);}
+float3 adjustColour(float3 colour){float l=dot(colour,float3(0.2126,0.7152,0.0722));colour=lerp(float3(l,l,l),colour,cColour.w);colour=(colour-0.5)*cColour.z+0.5;return saturate(colour*cColour.y);}float palettePhase(float value){float phase=frac(value);phase=pow(max(phase,1.0e-6),max(cPaletteControls.y,0.05));if(cStripeControls.w>0.5)phase=phase*phase*(3.0-2.0*phase);return phase;}
+float3 finishEscape(int iteration,float magnitudeSquared,float trap,float distanceEstimate,float stripeAverage){int maxIterations=(int)cIntegers0.x;if(iteration>=maxIterations)return cInterior.rgb;float smoothIteration=(float)iteration;if(cFlags3.y>0.5&&magnitudeSquared>1.0){float lm=0.5*log(max(magnitudeSquared,1.000001));if(lm>0.0){float correction=log(max(lm,0.000001))/log(max((float)((int)cIntegers0.y),2.0));if(correction==correction&&abs(correction)<3.4e38)smoothIteration=(float)iteration+1.0-correction;}}float t=smoothIteration/max((float)maxIterations,1.0)*cPaletteControls.x;float feature=0.0;int method=(int)cFlags2.y;if(method==1){t=-log(max(trap,1.0e-8))*0.32*cPaletteControls.x;feature=exp(-trap*18.0);}else if(method==2&&distanceEstimate>0.0){t=-log(max(distanceEstimate,1.0e-10))*0.22*cPaletteControls.x;feature=exp(-distanceEstimate*80.0);}if(cStripeControls.z>0.5)t+=(stripeAverage-0.5)*cPaletteControls.z;t=palettePhase(t+cColour.x);float3 colour=lerp(cBackground.rgb,palette(t),0.96);float depth=1.0+cEffects.y*(1.0-smoothIteration/max((float)maxIterations,1.0))*0.45;colour*=depth;colour+=palette(t+0.08)*feature*cDistanceControls.x*0.6;return adjustColour(colour);}
+float3 finishNewton(int iteration,float root,float trap){if(root<0.0)return cInterior.rgb;float base=root/max(cFlags2.x,1.0);float shade=1.0-(float)iteration/max(cIntegers0.x,1.0);float3 colour=palette(base+cColour.x+shade*0.08);float glow=exp(-trap*18.0)*cDistanceControls.x;colour=colour*(0.45+0.75*shade)+palette(base+0.12)*glow;return adjustColour(colour);}
 
 float3 newtonFloat(float2 pixel){float2 z=pixel;float root=-1.0;int iteration=0;float trap=1.0e20;int maxIterations=(int)cIntegers0.x;int degree=(int)cFlags2.x;[loop]for(int i=0;i<4096;++i){if(i>=maxIterations)break;trap=min(trap,trapDistance(z));float2 zp=cpowInt(z,degree);float2 residual=zp-cNewtonTargetRelaxation.xy;if(length(residual)<=cEffects.z){float a=atan2(z.y,z.x);if(a<0.0)a+=6.2831853;root=floor(a/6.2831853*(float)degree+0.5);if(root>=(float)degree)root=0.0;iteration=i;break;}float2 derivative=(float)degree*cpowInt(z,degree-1);if(dot(derivative,derivative)<1.0e-24)break;z-=cmul(cNewtonTargetRelaxation.zw,cdiv(residual,derivative));iteration=i+1;}return finishNewton(iteration,root,trap);}
 
-float3 directFloat(float2 p){float2 pixel=cCentre.xy+p*cCamera.x;if(cFlags1.w>0.5)return newtonFloat(pixel);float2 c=cFlags1.z>0.5?cInitialJulia.zw:pixel;float2 z=initialValue(pixel,c);int iteration=0;float magnitudeSquared=dot(z,z);float trap=1.0e20;float2 dz=cFlags1.z>0.5?float2(1.0,0.0):float2(0.0,0.0);bool derivativeSupported=(int)cFlags1.x==0&&cFlags0.x<0.5&&cFlags0.y<0.5&&cFlags0.z<0.5&&cFlags0.w<0.5&&(int)cIntegers0.w==0;float2 aq=animatedCoeff(cEquationQuadraticLinear.xy,0.0),ab=animatedCoeff(cEquationQuadraticLinear.zw,1.7),ac=animatedCoeff(cEquationParameterConstant.xy,3.1),ad=animatedCoeff(cEquationParameterConstant.zw,4.9),ae=cIterationReciprocal.xy,ar=cIterationReciprocal.zw;int maxIterations=(int)cIntegers0.x;[loop]for(int i=0;i<4096;++i){if(i>=maxIterations)break;magnitudeSquared=dot(z,z);if(magnitudeSquared>cOrbit.w)break;trap=min(trap,trapDistance(z));float2 w=transformZ(z);float2 wp=cpowInt(w,(int)cIntegers0.y);float2 next=cmul(aq,wp)+cmul(ab,w)+cmul(ac,cpowInt(c,(int)cIntegers0.z))+ad+ae*(float)i;if((int)cIntegers0.w>0&&length(ar)>1.0e-8){float2 den=cpowInt(w,(int)cIntegers0.w);if(dot(den,den)<1.0e-24){magnitudeSquared=cOrbit.w*2.0;iteration=i+1;break;}next+=cdiv(ar,den);}if(derivativeSupported){float2 local=cmul(aq,(float)((int)cIntegers0.y)*cpowInt(w,(int)cIntegers0.y-1))+ab;dz=cmul(local,dz)+(cFlags1.z>0.5?float2(0.0,0.0):cmul(ac,(float)((int)cIntegers0.z)*cpowInt(c,(int)cIntegers0.z-1)));}z=next;iteration=i+1;}float distanceEstimate=0.0;float mag=sqrt(max(magnitudeSquared,0.0));float derivativeMagnitude=length(dz);if(derivativeSupported&&derivativeMagnitude>1.0e-12&&mag>1.0)distanceEstimate=0.5*log(mag)*mag/derivativeMagnitude;return finishEscape(iteration,magnitudeSquared,trap,distanceEstimate);}
+float3 directFloat(float2 p){float2 pixel=cCentre.xy+p*cCamera.x;if(cFlags1.w>0.5)return newtonFloat(pixel);float2 c=cFlags1.z>0.5?cInitialJulia.zw:pixel;float2 z=initialValue(pixel,c);int iteration=0;float magnitudeSquared=dot(z,z);float trap=1.0e20;float stripeSum=0.0;float stripeSamples=0.0;float2 dz=cFlags1.z>0.5?float2(1.0,0.0):float2(0.0,0.0);float2 derivativeX=float2(0.0,0.0);float2 derivativeY=float2(0.0,0.0);bool derivativeSupported=(int)cFlags1.x==0&&cFlags0.x<0.5&&cFlags0.y<0.5&&cFlags0.z<0.5&&cFlags0.w<0.5&&(int)cIntegers0.w==0;bool conjugateDerivativeSupported=cDistanceControls.y>0.5;float2 aq=animatedCoeff(cEquationQuadraticLinear.xy,0.0),ab=animatedCoeff(cEquationQuadraticLinear.zw,1.7),ac=animatedCoeff(cEquationParameterConstant.xy,3.1),ad=animatedCoeff(cEquationParameterConstant.zw,4.9),ae=cIterationReciprocal.xy,ar=cIterationReciprocal.zw;int maxIterations=(int)cIntegers0.x;[loop]for(int i=0;i<4096;++i){if(i>=maxIterations)break;magnitudeSquared=dot(z,z);if(magnitudeSquared>cOrbit.w)break;trap=min(trap,trapDistance(z));if(cStripeControls.z>0.5&&i>=(int)cStripeControls.y){stripeSum+=0.5+0.5*sin(cPaletteControls.w*atan2(z.y,z.x)+cStripeControls.x);stripeSamples+=1.0;}float2 w=transformZ(z);float2 wp=cpowInt(w,(int)cIntegers0.y);float2 next=cmul(aq,wp)+cmul(ab,w)+cmul(ac,cpowInt(c,(int)cIntegers0.z))+ad+ae*(float)i;if((int)cIntegers0.w>0&&length(ar)>1.0e-8){float2 den=cpowInt(w,(int)cIntegers0.w);if(dot(den,den)<1.0e-24){magnitudeSquared=cOrbit.w*2.0;iteration=i+1;break;}next+=cdiv(ar,den);}if(derivativeSupported){float2 local=cmul(aq,(float)((int)cIntegers0.y)*cpowInt(w,(int)cIntegers0.y-1))+ab;dz=cmul(local,dz)+(cFlags1.z>0.5?float2(0.0,0.0):cmul(ac,(float)((int)cIntegers0.z)*cpowInt(c,(int)cIntegers0.z-1)));}else if(conjugateDerivativeSupported){float2 local=2.0*w;derivativeX=cmul(local,float2(derivativeX.x,-derivativeX.y))+float2(1.0,0.0);derivativeY=cmul(local,float2(derivativeY.x,-derivativeY.y))+float2(0.0,1.0);}z=next;iteration=i+1;}float distanceEstimate=0.0;float mag=sqrt(max(magnitudeSquared,0.0));float derivativeMagnitude=derivativeSupported?length(dz):(conjugateDerivativeSupported?jacobianStretch(derivativeX,derivativeY):0.0);if(derivativeMagnitude>1.0e-12&&mag>1.0)distanceEstimate=0.5*log(mag)*mag/derivativeMagnitude;return finishEscape(iteration,magnitudeSquared,trap,distanceEstimate,stripeSamples>0.0?stripeSum/stripeSamples:0.5);}
 
-float3 directSplit(float2 p){float2 rx=ddAdd(float2(cCentre.x,cCentre.z),ddMul(float2(cCamera.x,0.0),float2(p.x,0.0)));float2 iy=ddAdd(float2(cCentre.y,cCentre.w),ddMul(float2(cCamera.x,0.0),float2(p.y,0.0)));float4 c=float4(rx.x,iy.x,rx.y,iy.y);float4 z=float4(0.0,0.0,0.0,0.0);int iteration=0;float magnitudeSquared=0.0;float4 aq=cddFromVec2(cEquationQuadraticLinear.xy),ab=cddFromVec2(cEquationQuadraticLinear.zw),ac=cddFromVec2(cEquationParameterConstant.xy),ad=cddFromVec2(cEquationParameterConstant.zw);int maxIterations=(int)cIntegers0.x;[loop]for(int i=0;i<4096;++i){if(i>=maxIterations)break;float2 zv=cddValue(z);magnitudeSquared=dot(zv,zv);if(magnitudeSquared>cOrbit.w)break;z=cddAdd(cddAdd(cddMul(aq,cddMul(z,z)),cddMul(ab,z)),cddAdd(cddMul(ac,c),ad));iteration=i+1;}return finishEscape(iteration,magnitudeSquared,1.0e20,0.0);}
+float3 directSplit(float2 p){float2 rx=ddAdd(float2(cCentre.x,cCentre.z),ddMul(float2(cCamera.x,0.0),float2(p.x,0.0)));float2 iy=ddAdd(float2(cCentre.y,cCentre.w),ddMul(float2(cCamera.x,0.0),float2(p.y,0.0)));float4 c=float4(rx.x,iy.x,rx.y,iy.y);float4 z=float4(0.0,0.0,0.0,0.0);int iteration=0;float magnitudeSquared=0.0;float stripeSum=0.0;float stripeSamples=0.0;float4 aq=cddFromVec2(cEquationQuadraticLinear.xy),ab=cddFromVec2(cEquationQuadraticLinear.zw),ac=cddFromVec2(cEquationParameterConstant.xy),ad=cddFromVec2(cEquationParameterConstant.zw);int maxIterations=(int)cIntegers0.x;[loop]for(int i=0;i<4096;++i){if(i>=maxIterations)break;float2 zv=cddValue(z);magnitudeSquared=dot(zv,zv);if(magnitudeSquared>cOrbit.w)break;if(cStripeControls.z>0.5&&i>=(int)cStripeControls.y){stripeSum+=0.5+0.5*sin(cPaletteControls.w*atan2(zv.y,zv.x)+cStripeControls.x);stripeSamples+=1.0;}float4 w=cFlags0.z>0.5?cddConj(z):z;z=cddAdd(cddAdd(cddMul(aq,cddMul(w,w)),cddMul(ab,w)),cddAdd(cddMul(ac,c),ad));iteration=i+1;}return finishEscape(iteration,magnitudeSquared,1.0e20,0.0,stripeSamples>0.0?stripeSum/stripeSamples:0.5);}
 float4 referenceTimesQ(float4 realParts,float4 imaginaryParts,float4 q){float4 result=float4(0.0,0.0,0.0,0.0);result=cddAdd(result,cddMul(cddFromVec2(float2(realParts.x,imaginaryParts.x)),q));result=cddAdd(result,cddMul(cddFromVec2(float2(realParts.y,imaginaryParts.y)),q));result=cddAdd(result,cddMul(cddFromVec2(float2(realParts.z,imaginaryParts.z)),q));result=cddAdd(result,cddMul(cddFromVec2(float2(realParts.w,imaginaryParts.w)),q));return result;}
-float3 perturb(float2 p){float4 q=float4(0.0,0.0,0.0,0.0);int iteration=0;float magnitudeSquared=0.0;float4 aq=cddFromVec2(cEquationQuadraticLinear.xy),ab=cddFromVec2(cEquationQuadraticLinear.zw),ac=cddFromVec2(cEquationParameterConstant.xy);float4 local=cddFromVec2(p);int maxIterations=(int)cIntegers0.x;int referenceLength=max((int)cAnimation.y,1);[loop]for(int i=0;i<4096;++i){if(i>=maxIterations||i>=referenceLength)break;float4 zr=ReferenceOrbitReal.Load(int2(i,0));float4 zi=ReferenceOrbitImaginary.Load(int2(i,0));float2 Z=float2(zr.x+zr.y+zr.z+zr.w,zi.x+zi.y+zi.z+zi.w);float2 delta=cddValue(cddScale(q,cCamera.x));float2 approximate=Z+delta;magnitudeSquared=dot(approximate,approximate);if(magnitudeSquared>cOrbit.w)break;float4 twiceZq=cddScale(referenceTimesQ(zr,zi,q),2.0);float4 quadraticDelta=cddAdd(twiceZq,cddScale(cddMul(q,q),cCamera.x));q=cddAdd(cddAdd(cddMul(aq,quadraticDelta),cddMul(ab,q)),cddMul(ac,local));iteration=i+1;}return finishEscape(iteration,magnitudeSquared,1.0e20,0.0);}
-float3 sampleFractal(float2 uv){float aspect=cCamera.y/max(cCamera.z,1.0);float2 p=float2((uv.x*2.0-1.0)*aspect,((1.0-uv.y)*2.0-1.0));int mode=(int)cFlags3.w;if(mode==1)return directSplit(p);if(mode==2)return perturb(p);return directFloat(p);}
+float3 perturb(float2 p){float4 q=float4(0.0,0.0,0.0,0.0);int iteration=0;float magnitudeSquared=0.0;float stripeSum=0.0;float stripeSamples=0.0;float4 aq=cddFromVec2(cEquationQuadraticLinear.xy),ab=cddFromVec2(cEquationQuadraticLinear.zw),ac=cddFromVec2(cEquationParameterConstant.xy);float4 local=cddFromVec2(p);int maxIterations=(int)cIntegers0.x;int referenceLength=max((int)cAnimation.y,1);[loop]for(int i=0;i<4096;++i){if(i>=maxIterations||i>=referenceLength)break;float4 zr=ReferenceOrbitReal.Load(int2(i,0));float4 zi=ReferenceOrbitImaginary.Load(int2(i,0));float2 Z=float2(zr.x+zr.y+zr.z+zr.w,zi.x+zi.y+zi.z+zi.w);float2 delta=cddValue(cddScale(q,cCamera.x));float2 approximate=Z+delta;float relativeDelta=length(delta)/max(1.0,length(Z));if(isnan(relativeDelta)||relativeDelta>0.5||abs(q.x)>1.0e30||abs(q.y)>1.0e30||abs(q.z)>1.0e30||abs(q.w)>1.0e30)return directSplit(p);magnitudeSquared=dot(approximate,approximate);if(magnitudeSquared>cOrbit.w)break;if(cStripeControls.z>0.5&&i>=(int)cStripeControls.y){stripeSum+=0.5+0.5*sin(cPaletteControls.w*atan2(approximate.y,approximate.x)+cStripeControls.x);stripeSamples+=1.0;}float4 workingQ=cFlags0.z>0.5?cddConj(q):q;float4 referenceImaginary=cFlags0.z>0.5?-zi:zi;float4 twiceZq=cddScale(referenceTimesQ(zr,referenceImaginary,workingQ),2.0);float4 quadraticDelta=cddAdd(twiceZq,cddScale(cddMul(workingQ,workingQ),cCamera.x));q=cddAdd(cddAdd(cddMul(aq,quadraticDelta),cddMul(ab,workingQ)),cddMul(ac,local));iteration=i+1;}return finishEscape(iteration,magnitudeSquared,1.0e20,0.0,stripeSamples>0.0?stripeSum/stripeSamples:0.5);}
+float3 sampleFractal(float2 uv){float aspect=cCamera.y/max(cCamera.z,1.0);float2 local=float2((uv.x*2.0-1.0)*aspect,((1.0-uv.y)*2.0-1.0));float sine=sin(cAnimation.w),cosine=cos(cAnimation.w);float2 p=float2(local.x*cosine-local.y*sine,local.x*sine+local.y*cosine);int mode=(int)cFlags3.w;if(mode==1)return directSplit(p);if(mode==2)return perturb(p);return directFloat(p);}
 
 float4 FractalMain(VertexOutput input) : SV_Target {int samples=clamp((int)cFlags3.z,1,4);float3 colour=float3(0.0,0.0,0.0);float count=0.0;[loop]for(int y=0;y<4;++y){if(y>=samples)break;[loop]for(int x=0;x<4;++x){if(x>=samples)break;float2 offset=(float2((float)x,(float)y)+0.5)/(float)samples-0.5;colour+=sampleFractal(input.uv+offset/cCamera.yz);count+=1.0;}}return float4(colour/max(count,1.0),1.0);}
 
-float4 PostMain(VertexOutput input) : SV_Target {float2 texel=cTexelGlow.xy;float glowStrength=cTexelGlow.z;float3 base=FrameTexture.Sample(PointClamp,input.uv).rgb;float3 blur=float3(0.0,0.0,0.0);blur+=FrameTexture.Sample(PointClamp,input.uv+texel*float2(-1.0,-1.0)).rgb;blur+=FrameTexture.Sample(PointClamp,input.uv+texel*float2(0.0,-1.0)).rgb*2.0;blur+=FrameTexture.Sample(PointClamp,input.uv+texel*float2(1.0,-1.0)).rgb;blur+=FrameTexture.Sample(PointClamp,input.uv+texel*float2(-1.0,0.0)).rgb*2.0;blur+=base*4.0;blur+=FrameTexture.Sample(PointClamp,input.uv+texel*float2(1.0,0.0)).rgb*2.0;blur+=FrameTexture.Sample(PointClamp,input.uv+texel*float2(-1.0,1.0)).rgb;blur+=FrameTexture.Sample(PointClamp,input.uv+texel*float2(0.0,1.0)).rgb*2.0;blur+=FrameTexture.Sample(PointClamp,input.uv+texel*float2(1.0,1.0)).rgb;blur/=16.0;float bloom=max(max(blur.r,blur.g),blur.b);float3 glow=blur*max(bloom-0.22,0.0)*glowStrength;return float4(saturate(base+glow),1.0);}
+float brightContribution(float3 colour){float brightness=max(max(colour.r,colour.g),colour.b);float threshold=cBloom.y;float knee=cBloom.z;if(knee<=0.00001)return brightness>threshold?(brightness-threshold)/max(brightness,0.00001):0.0;float soft=clamp(brightness-threshold+knee,0.0,2.0*knee);soft=soft*soft/(4.0*knee+0.00001);return max(brightness-threshold,soft)/max(brightness,0.00001);}float4 PostMain(VertexOutput input) : SV_Target {int radius=clamp((int)cBloom.w,0,16);float sigma=max((float)radius*0.5,0.5);float3 sum=float3(0.0,0.0,0.0);float total=0.0;[loop]for(int i=-16;i<=16;++i){if(abs(i)>radius)continue;float fi=(float)i;float weight=exp(-0.5*fi*fi/(sigma*sigma));float3 sampleColour=FrameTexture.Sample(PointClamp,input.uv+cTexelDirection.xy*cTexelDirection.zw*fi).rgb;if(cPostPass.x<0.5)sampleColour*=brightContribution(sampleColour);sum+=sampleColour*weight;total+=weight;}float3 blurred=sum/max(total,0.00001);if(cPostPass.x<0.5)return float4(blurred,1.0);float3 base=OriginalTexture.Sample(PointClamp,input.uv).rgb;return float4(saturate(base+blurred*cBloom.x),1.0);}
 )hlsl";
 
 std::string BlobText(ID3DBlob* blob) {
@@ -154,13 +162,14 @@ Direct3D11Renderer::~Direct3D11Renderer() {
 }
 
 #ifdef _WIN32
-bool Direct3D11Renderer::Initialise(HWND window, std::string& error) {
+bool Direct3D11Renderer::Initialise(HWND window, std::string& error, bool useWarp) {
     Shutdown();
     if (!window || !IsWindow(window)) {
         error = "Direct3D 11 requires a valid render window.";
         return false;
     }
     window_ = window;
+    useWarp_ = useWarp;
     RECT client{};
     GetClientRect(window_, &client);
     Resize(client.right - client.left, client.bottom - client.top);
@@ -196,20 +205,22 @@ bool Direct3D11Renderer::CreateDeviceAndSwapChain(std::string& error) {
     };
     const D3D_FEATURE_LEVEL levels11_0[] = {D3D_FEATURE_LEVEL_11_0};
     const UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
+    const D3D_DRIVER_TYPE driverType = useWarp_ ? D3D_DRIVER_TYPE_WARP : D3D_DRIVER_TYPE_HARDWARE;
     HRESULT result = D3D11CreateDeviceAndSwapChain(
-        nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, flags,
+        nullptr, driverType, nullptr, flags,
         levelsWith11_1, static_cast<UINT>(std::size(levelsWith11_1)), D3D11_SDK_VERSION,
         &description, swapChain_.ReleaseAndGetAddressOf(), device_.ReleaseAndGetAddressOf(),
         &featureLevel_, context_.ReleaseAndGetAddressOf());
     if (result == E_INVALIDARG) {
         result = D3D11CreateDeviceAndSwapChain(
-            nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, flags,
+            nullptr, driverType, nullptr, flags,
             levels11_0, static_cast<UINT>(std::size(levels11_0)), D3D11_SDK_VERSION,
             &description, swapChain_.ReleaseAndGetAddressOf(), device_.ReleaseAndGetAddressOf(),
             &featureLevel_, context_.ReleaseAndGetAddressOf());
     }
     if (FAILED(result)) {
-        error = "A Direct3D 11 hardware device and swap chain could not be created.";
+        error = useWarp_ ? "A Direct3D 11 WARP device and swap chain could not be created."
+                         : "A Direct3D 11 hardware device and swap chain could not be created.";
         return false;
     }
 
@@ -381,6 +392,9 @@ bool Direct3D11Renderer::EnsureBackBuffer(std::string& error) {
 }
 
 void Direct3D11Renderer::DestroyRenderTarget() {
+    blurShaderView_.Reset();
+    blurTargetView_.Reset();
+    blurTexture_.Reset();
     renderShaderView_.Reset();
     renderTargetView_.Reset();
     renderTexture_.Reset();
@@ -394,11 +408,13 @@ bool Direct3D11Renderer::EnsureRenderTarget(int width, int height, double scale,
         static_cast<double>(width) * std::clamp(scale, 0.25, 1.0))));
     const int requestedHeight = std::max(1, static_cast<int>(std::lround(
         static_cast<double>(height) * std::clamp(scale, 0.25, 1.0))));
-    if (renderTexture_ && targetWidth_ == requestedWidth && targetHeight_ == requestedHeight) {
+    if (renderTexture_ && renderTargetView_ && renderShaderView_ &&
+        blurTexture_ && blurTargetView_ && blurShaderView_ &&
+        targetWidth_ == requestedWidth && targetHeight_ == requestedHeight) {
         return true;
     }
-    ID3D11ShaderResourceView* nullViews[4]{nullptr, nullptr, nullptr, nullptr};
-    context_->PSSetShaderResources(0, 4, nullViews);
+    ID3D11ShaderResourceView* nullViews[5]{nullptr, nullptr, nullptr, nullptr, nullptr};
+    context_->PSSetShaderResources(0, 5, nullViews);
     DestroyRenderTarget();
 
     D3D11_TEXTURE2D_DESC texture{};
@@ -428,6 +444,12 @@ bool Direct3D11Renderer::EnsureRenderTarget(int width, int height, double scale,
         error = "The Direct3D 11 off-screen shader view could not be created.";
         return false;
     }
+    result = device_->CreateTexture2D(&texture, nullptr, blurTexture_.ReleaseAndGetAddressOf());
+    if (FAILED(result)) { error = "The Direct3D 11 bloom texture could not be created."; return false; }
+    result = device_->CreateRenderTargetView(blurTexture_.Get(), nullptr, blurTargetView_.ReleaseAndGetAddressOf());
+    if (FAILED(result)) { error = "The Direct3D 11 bloom render-target view could not be created."; return false; }
+    result = device_->CreateShaderResourceView(blurTexture_.Get(), nullptr, blurShaderView_.ReleaseAndGetAddressOf());
+    if (FAILED(result)) { error = "The Direct3D 11 bloom shader view could not be created."; return false; }
     targetWidth_ = requestedWidth;
     targetHeight_ = requestedHeight;
     return true;
@@ -505,43 +527,13 @@ bool Direct3D11Renderer::UploadCustomPalette(const std::vector<Colour>& colours,
 PrecisionMode Direct3D11Renderer::ResolvePrecision(const RenderRegion& region,
                                                     const PrecisionSettings& settings,
                                                     std::string& error) const {
-    const bool legacyDeepZoomEquation = EquationSupportsPerturbation(region.equation);
-    const auto available = [&](PrecisionMode mode) {
-        switch (mode) {
-        case PrecisionMode::Float32: return true;
-        case PrecisionMode::Float64: return capabilities_.nativeFloat64;
-        case PrecisionMode::SplitFloat: return capabilities_.splitFloat && legacyDeepZoomEquation;
-        case PrecisionMode::Perturbation: return capabilities_.perturbation && legacyDeepZoomEquation;
-        case PrecisionMode::ArbitraryPrecisionPerturbation:
-            return capabilities_.arbitraryReference && legacyDeepZoomEquation;
-        case PrecisionMode::Automatic: return true;
-        }
-        return false;
-    };
-    const auto fallback = [&]() {
-        const double zoom = CameraZoom(region.camera);
-        if (!legacyDeepZoomEquation) return PrecisionMode::Float32;
-        if (zoom < 1.0e6) return PrecisionMode::Float32;
-        if (settings.allowSplitFloat && available(PrecisionMode::SplitFloat) && zoom < 1.0e13) {
-            return PrecisionMode::SplitFloat;
-        }
-        if (settings.allowArbitraryPrecision &&
-            available(PrecisionMode::ArbitraryPrecisionPerturbation)) {
-            return PrecisionMode::ArbitraryPrecisionPerturbation;
-        }
-        if (settings.allowPerturbation && available(PrecisionMode::Perturbation)) {
-            return PrecisionMode::Perturbation;
-        }
-        if (settings.allowSplitFloat && available(PrecisionMode::SplitFloat)) {
-            return PrecisionMode::SplitFloat;
-        }
-        return PrecisionMode::Float32;
-    };
-    if (settings.mode == PrecisionMode::Automatic) return fallback();
-    if (available(settings.mode)) return settings.mode;
-    if (settings.automaticFallback) return fallback();
-    error = "The selected precision strategy is unavailable in Direct3D 11 or incompatible with the selected equation operations.";
-    return settings.mode;
+    PrecisionMode mode = settings.mode;
+    const LegacyGpuPrecisionCapabilities capabilities{
+        capabilities_.nativeFloat64, capabilities_.splitFloat, capabilities_.perturbation,
+        capabilities_.arbitraryReference};
+    (void)ResolveLegacyGpuPrecision(region.camera, region.equation, settings, capabilities,
+                                    mode, error);
+    return mode;
 }
 
 bool Direct3D11Renderer::UploadReferenceOrbit(const RenderRegion& region, PrecisionMode mode,
@@ -693,14 +685,15 @@ bool Direct3D11Renderer::DrawFractalRegion(const RenderRegion& region,
                               static_cast<float>(region.brightness),
                               static_cast<float>(region.contrast),
                               static_cast<float>(region.saturation)};
-    constants.effects = Float4{static_cast<float>(region.equation.glowStrength),
+    constants.effects = Float4{0.0F,
                                static_cast<float>(region.equation.depthStrength),
                                static_cast<float>(region.equation.convergenceTolerance),
                                static_cast<float>(region.equation.coefficientAnimationSpeed)};
     constants.animation = Float4{
         static_cast<float>(region.equation.coefficientAnimationAmplitude),
         static_cast<float>(referenceOrbitLength_),
-        region.equation.animateCoefficients ? 1.0F : 0.0F, 0.0F};
+        region.equation.animateCoefficients ? 1.0F : 0.0F,
+        static_cast<float>(region.rotationDegrees * 3.14159265358979323846 / 180.0)};
     constants.interior = Float4{region.interiorColour.r, region.interiorColour.g,
                                 region.interiorColour.b, 0.0F};
     constants.background = Float4{region.backgroundColour.r, region.backgroundColour.g,
@@ -727,6 +720,18 @@ bool Direct3D11Renderer::DrawFractalRegion(const RenderRegion& region,
     constants.flags3 = Float4{useCustom ? 1.0F : 0.0F,
                               region.smoothColouring ? 1.0F : 0.0F,
                               static_cast<float>(std::clamp(aaLevel, 1, 4)), shaderPrecision};
+    constants.paletteControls = Float4{static_cast<float>(region.paletteFrequency),
+                                       static_cast<float>(region.paletteGamma),
+                                       static_cast<float>(region.equation.stripeStrength),
+                                       static_cast<float>(region.equation.stripeDensity)};
+    constants.stripeControls = Float4{static_cast<float>(region.equation.stripePhase),
+                                      static_cast<float>(region.equation.stripeStartIteration),
+                                      region.equation.stripeAverageEnabled ? 1.0F : 0.0F,
+                                      region.paletteInterpolation == PaletteInterpolation::Smoothstep ? 1.0F : 0.0F};
+    constants.distanceControls = Float4{
+        static_cast<float>(region.equation.edgeLightingStrength),
+        SupportsConjugateDistanceEstimation(region.equation) ? 1.0F : 0.0F,
+        0.0F, 0.0F};
     if (!UpdateBuffer(fractalConstantBuffer_.Get(), &constants, sizeof(constants), error)) {
         return false;
     }
@@ -760,8 +765,8 @@ bool Direct3D11Renderer::Render(const std::vector<RenderRegion>& regions,
         return false;
     }
 
-    ID3D11ShaderResourceView* nullViews[4]{nullptr, nullptr, nullptr, nullptr};
-    context_->PSSetShaderResources(0, 4, nullViews);
+    ID3D11ShaderResourceView* nullViews[5]{nullptr, nullptr, nullptr, nullptr, nullptr};
+    context_->PSSetShaderResources(0, 5, nullViews);
     ID3D11RenderTargetView* target = renderTargetView_.Get();
     context_->OMSetRenderTargets(1, &target, nullptr);
     const float clear[4]{0.0F, 0.0F, 0.0F, 1.0F};
@@ -771,10 +776,23 @@ bool Direct3D11Renderer::Render(const std::vector<RenderRegion>& regions,
     context_->VSSetShader(fullScreenVertexShader_.Get(), nullptr, 0);
     context_->RSSetState(rasterizerState_.Get());
     postProcessGlowStrength_ = 0.0F;
+    postProcessBloomThreshold_ = 0.22F;
+    postProcessBloomSoftKnee_ = 0.0F;
+    postProcessBloomRadius_ = 0;
+    bool bloomConfigured = false;
 
     for (const auto& region : regions) {
-        postProcessGlowStrength_ = std::max(
-            postProcessGlowStrength_, static_cast<float>(region.equation.glowStrength));
+        const float bloomStrength = static_cast<float>(region.equation.glowStrength);
+        postProcessGlowStrength_ = std::max(postProcessGlowStrength_, bloomStrength);
+        if (bloomStrength > 0.0F) {
+            const float threshold = static_cast<float>(region.equation.bloomThreshold);
+            postProcessBloomThreshold_ = bloomConfigured
+                ? std::min(postProcessBloomThreshold_, threshold) : threshold;
+            postProcessBloomSoftKnee_ = std::max(
+                postProcessBloomSoftKnee_, static_cast<float>(region.equation.bloomSoftKnee));
+            postProcessBloomRadius_ = std::max(postProcessBloomRadius_, region.equation.bloomRadius);
+            bloomConfigured = true;
+        }
         RECT scaled{
             static_cast<LONG>(std::lround(static_cast<double>(region.pixels.left) * targetWidth_ / width_)),
             static_cast<LONG>(std::lround(static_cast<double>(region.pixels.top) * targetHeight_ / height_)),
@@ -791,30 +809,54 @@ bool Direct3D11Renderer::Render(const std::vector<RenderRegion>& regions,
         }
     }
 
+    ID3D11SamplerState* sampler = pointClampSampler_.Get();
+    ID3D11Buffer* postBuffer = postConstantBuffer_.Get();
+    context_->PSSetSamplers(1, 1, &sampler);
+    context_->PSSetConstantBuffers(1, 1, &postBuffer);
+    context_->PSSetShader(postPixelShader_.Get(), nullptr, 0);
+
+    // Horizontal bright-pass blur at the fractal render resolution.
+    target = blurTargetView_.Get();
+    context_->OMSetRenderTargets(1, &target, nullptr);
+    context_->ClearRenderTargetView(blurTargetView_.Get(), clear);
+    D3D11_VIEWPORT viewport{};
+    viewport.Width = static_cast<float>(targetWidth_);
+    viewport.Height = static_cast<float>(targetHeight_);
+    viewport.MaxDepth = 1.0F;
+    context_->RSSetViewports(1, &viewport);
+    D3D11_RECT scissor{0, 0, targetWidth_, targetHeight_};
+    context_->RSSetScissorRects(1, &scissor);
+    PostConstants post{};
+    post.texelDirection = Float4{1.0F / static_cast<float>(std::max(targetWidth_, 1)),
+                                 1.0F / static_cast<float>(std::max(targetHeight_, 1)),
+                                 1.0F, 0.0F};
+    post.bloom = Float4{postProcessGlowStrength_, postProcessBloomThreshold_,
+                        postProcessBloomSoftKnee_, static_cast<float>(postProcessBloomRadius_)};
+    post.pass = Float4{0.0F, 0.0F, 0.0F, 0.0F};
+    if (!UpdateBuffer(postConstantBuffer_.Get(), &post, sizeof(post), error)) return false;
+    ID3D11ShaderResourceView* horizontalViews[2]{renderShaderView_.Get(), nullptr};
+    context_->PSSetShaderResources(3, 2, horizontalViews);
+    context_->Draw(3, 0);
+    ID3D11ShaderResourceView* clearPostViews[2]{nullptr, nullptr};
+    context_->PSSetShaderResources(3, 2, clearPostViews);
+
+    // Vertical blur and composite into the retained final-frame texture.
     target = outputTargetView_.Get();
     context_->OMSetRenderTargets(1, &target, nullptr);
     context_->ClearRenderTargetView(outputTargetView_.Get(), clear);
-    D3D11_VIEWPORT viewport{};
     viewport.Width = static_cast<float>(width_);
     viewport.Height = static_cast<float>(height_);
-    viewport.MaxDepth = 1.0F;
     context_->RSSetViewports(1, &viewport);
-    D3D11_RECT scissor{0, 0, width_, height_};
+    scissor = D3D11_RECT{0, 0, width_, height_};
     context_->RSSetScissorRects(1, &scissor);
-    PostConstants post{};
-    post.texelGlow = Float4{1.0F / static_cast<float>(std::max(targetWidth_, 1)),
-                            1.0F / static_cast<float>(std::max(targetHeight_, 1)),
-                            postProcessGlowStrength_, 0.0F};
+    post.texelDirection.z = 0.0F;
+    post.texelDirection.w = 1.0F;
+    post.pass.x = 1.0F;
     if (!UpdateBuffer(postConstantBuffer_.Get(), &post, sizeof(post), error)) return false;
-    ID3D11ShaderResourceView* frameView = renderShaderView_.Get();
-    context_->PSSetShaderResources(3, 1, &frameView);
-    ID3D11SamplerState* sampler = pointClampSampler_.Get();
-    context_->PSSetSamplers(1, 1, &sampler);
-    ID3D11Buffer* postBuffer = postConstantBuffer_.Get();
-    context_->PSSetConstantBuffers(1, 1, &postBuffer);
-    context_->PSSetShader(postPixelShader_.Get(), nullptr, 0);
+    ID3D11ShaderResourceView* verticalViews[2]{blurShaderView_.Get(), renderShaderView_.Get()};
+    context_->PSSetShaderResources(3, 2, verticalViews);
     context_->Draw(3, 0);
-    context_->PSSetShaderResources(3, 1, nullViews);
+    context_->PSSetShaderResources(3, 2, clearPostViews);
     context_->OMSetRenderTargets(0, nullptr, nullptr);
     context_->CopyResource(backBufferTexture_.Get(), outputTexture_.Get());
 
@@ -891,6 +933,75 @@ bool Direct3D11Renderer::CapturePixels(std::vector<std::uint32_t>& pixels, int& 
     return true;
 }
 
+bool Direct3D11Renderer::CaptureReferenceOrbitTexture(ReferenceOrbit& orbit,
+                                                       std::string& error) {
+    orbit = {};
+    if (!ready_ || !device_ || !context_ || !referenceOrbitRealTexture_ ||
+        !referenceOrbitImaginaryTexture_ || referenceOrbitLength_ <= 0) {
+        error = "No completed Direct3D 11 reference-orbit texture is available for capture.";
+        return false;
+    }
+
+    D3D11_TEXTURE1D_DESC description{};
+    referenceOrbitRealTexture_->GetDesc(&description);
+    if (description.Width != static_cast<UINT>(referenceOrbitLength_) ||
+        description.Format != DXGI_FORMAT_R32G32B32A32_FLOAT) {
+        error = "The Direct3D 11 reference-orbit texture does not match its float4 transport contract.";
+        return false;
+    }
+    D3D11_TEXTURE1D_DESC stagingDescription = description;
+    stagingDescription.Usage = D3D11_USAGE_STAGING;
+    stagingDescription.BindFlags = 0;
+    stagingDescription.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    stagingDescription.MiscFlags = 0;
+    ComPtr<ID3D11Texture1D> realStaging;
+    ComPtr<ID3D11Texture1D> imaginaryStaging;
+    HRESULT result = device_->CreateTexture1D(&stagingDescription, nullptr,
+                                               realStaging.ReleaseAndGetAddressOf());
+    if (SUCCEEDED(result)) {
+        result = device_->CreateTexture1D(&stagingDescription, nullptr,
+                                          imaginaryStaging.ReleaseAndGetAddressOf());
+    }
+    if (FAILED(result)) {
+        error = "Direct3D 11 staging reference-orbit textures could not be created for capture.";
+        return false;
+    }
+    context_->CopyResource(realStaging.Get(), referenceOrbitRealTexture_.Get());
+    context_->CopyResource(imaginaryStaging.Get(), referenceOrbitImaginaryTexture_.Get());
+
+    D3D11_MAPPED_SUBRESOURCE realMapped{};
+    result = context_->Map(realStaging.Get(), 0, D3D11_MAP_READ, 0, &realMapped);
+    if (FAILED(result) || !realMapped.pData) {
+        error = "The Direct3D 11 real reference-orbit texture could not be mapped.";
+        return false;
+    }
+    D3D11_MAPPED_SUBRESOURCE imaginaryMapped{};
+    result = context_->Map(imaginaryStaging.Get(), 0, D3D11_MAP_READ, 0, &imaginaryMapped);
+    if (FAILED(result) || !imaginaryMapped.pData) {
+        context_->Unmap(realStaging.Get(), 0);
+        error = "The Direct3D 11 imaginary reference-orbit texture could not be mapped.";
+        return false;
+    }
+
+    const std::size_t byteCount = static_cast<std::size_t>(description.Width) * sizeof(Float4);
+    if (realMapped.RowPitch < byteCount || imaginaryMapped.RowPitch < byteCount) {
+        context_->Unmap(imaginaryStaging.Get(), 0);
+        context_->Unmap(realStaging.Get(), 0);
+        error = "The Direct3D 11 reference-orbit readback row pitch is too small.";
+        return false;
+    }
+    const auto* real = static_cast<const Float4*>(realMapped.pData);
+    const auto* imaginary = static_cast<const Float4*>(imaginaryMapped.pData);
+    orbit.points.resize(description.Width);
+    for (std::size_t i = 0; i < orbit.points.size(); ++i) {
+        orbit.points[i].real = {real[i].x, real[i].y, real[i].z, real[i].w};
+        orbit.points[i].imaginary = {imaginary[i].x, imaginary[i].y, imaginary[i].z, imaginary[i].w};
+    }
+    context_->Unmap(imaginaryStaging.Get(), 0);
+    context_->Unmap(realStaging.Get(), 0);
+    return true;
+}
+
 std::string Direct3D11Renderer::DeviceRemovedError(HRESULT result) const {
     std::ostringstream message;
     message << "Direct3D 11 operation failed (HRESULT 0x" << std::hex
@@ -931,6 +1042,7 @@ void Direct3D11Renderer::Shutdown() {
     context_.Reset();
     device_.Reset();
     window_ = nullptr;
+    useWarp_ = false;
     width_ = height_ = 1;
     graphicsDescription_.clear();
     precisionDescription_ = "Not rendered yet";

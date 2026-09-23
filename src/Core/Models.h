@@ -1,9 +1,10 @@
 #pragma once
 
+#include "Core/Precision/ExactCamera.h"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
-#include <map>
 #include <optional>
 #include <string>
 #include <vector>
@@ -14,25 +15,32 @@ enum class AnimationMode { AutomaticJourney, ContinuousZoom, StaticAnimatedColou
 enum class ZoomRestartBehaviour { Restart, PingPong };
 enum class Palette { ClassicSpectrum, DeepOcean, Fire, PurpleNeon, GreenMatrix, Gold, Ice, Greyscale, Pastel, HighContrast };
 enum class PerformanceProfile { BatterySaver, Balanced, HighQuality, Custom };
-enum class MonitorMode { Mirror, Span, Independent };
+enum class MonitorMode { Mirror, Span };
 enum class PrecisionMode { Automatic, Float32, Float64, SplitFloat, Perturbation, ArbitraryPrecisionPerturbation };
 enum class StaticSlideshowOrder { Sequential, Shuffle };
+enum class SavedImageFormat { Png, Jpeg, Tiff, Bmp };
+enum class DesktopMode { None, StaticImage, Slideshow, Video };
 enum class EquationUnaryTransform { None, Sin, Cos, Exp, Log };
 enum class InitialZMode { Zero, Fixed, Parameter, CriticalPoint };
 enum class FractalRenderMode { EscapeTime, Newton };
 enum class ColouringMethod { SmoothEscape, OrbitTrap, DistanceEstimation, NewtonBasins };
 enum class OrbitTrapType { Point, Cross, Circle };
+enum class PaletteInterpolation { Linear, Smoothstep };
 
 struct Colour {
     float r{0.0F};
     float g{0.0F};
     float b{0.0F};
     float a{1.0F};
+
+    bool operator==(const Colour&) const = default;
 };
 
 struct ComplexCoefficient {
     double real{0.0};
     double imaginary{0.0};
+
+    bool operator==(const ComplexCoefficient&) const = default;
 };
 
 struct EquationSettings {
@@ -72,12 +80,29 @@ struct EquationSettings {
     OrbitTrapType orbitTrap{OrbitTrapType::Point};
     ComplexCoefficient orbitTrapPoint{0.0, 0.0};
     double orbitTrapRadius{0.5};
+    // Screen-space bloom strength. Mathematical boundary lighting is stored
+    // separately so a narrow edge can be adjusted without changing blur/bloom.
     double glowStrength{0.0};
+    // Bright-pass bloom controls. Radius is measured in render-target pixels
+    // and is also used by tiled export to determine the required overlap.
+    double bloomThreshold{0.22};
+    double bloomSoftKnee{0.0};
+    int bloomRadius{1};
+    double edgeLightingStrength{0.0};
     double depthStrength{0.0};
+    // Optional orbit-angle stripe averaging adds fine filaments and spokes
+    // without replacing the selected base colouring method.
+    bool stripeAverageEnabled{false};
+    double stripeDensity{8.0};
+    double stripePhase{0.0};
+    double stripeStrength{0.0};
+    int stripeStartIteration{8};
 
     bool animateCoefficients{false};
     double coefficientAnimationSpeed{0.25};
     double coefficientAnimationAmplitude{0.0};
+
+    bool operator==(const EquationSettings&) const = default;
 };
 
 struct EquationPreset {
@@ -99,13 +124,21 @@ struct CameraState {
     // Compensated low components preserve pan offsets below one double ULP.
     double centreXLow{0.0};
     double centreYLow{0.0};
+
+    bool operator==(const CameraState&) const = default;
 };
 
 struct Preset {
     std::string id;
     std::string name;
     bool builtIn{false};
+    // PH-12 durable authority. Until schema-3 migration is complete an absent
+    // value denotes a legacy in-memory preset awaiting one-way reconstruction.
+    std::optional<ExactCamera> exactCamera;
     CameraState camera;
+    // Clockwise screen-space rotation of the view. The complex-plane centre
+    // and scale remain unchanged when this value changes.
+    double rotationDegrees{0.0};
     double startingScale{1.5};
     double maximumZoom{1.0e30};
     double zoomSpeed{0.08};
@@ -117,6 +150,9 @@ struct Preset {
     // interpolated in list order and uploaded as a GPU palette texture.
     std::vector<Colour> customPaletteColours;
     double colourOffset{0.0};
+    double paletteFrequency{8.0};
+    double paletteGamma{1.0};
+    PaletteInterpolation paletteInterpolation{PaletteInterpolation::Linear};
     double colourCycleSpeed{0.02};
     double brightness{1.0};
     double contrast{1.0};
@@ -132,6 +168,8 @@ struct Preset {
     int frameRateLimit{30};
     double renderScale{0.75};
     int antiAliasingLevel{1};
+
+    bool operator==(const Preset&) const = default;
 };
 
 struct PrecisionSettings {
@@ -142,6 +180,8 @@ struct PrecisionSettings {
     bool allowArbitraryPrecision{true};
     bool automaticFallback{true};
     int arbitraryPrecisionBits{256};
+
+    bool operator==(const PrecisionSettings&) const = default;
 };
 
 
@@ -185,7 +225,9 @@ struct GeneralSettings {
     bool reducedMotion{false};
     bool colourCyclingEnabled{false};
     bool restoreOnExit{true};
+    // Deprecated compatibility flag. New launches use defaultDesktopMode.
     bool startWallpaperOnLaunch{false};
+    DesktopMode defaultDesktopMode{DesktopMode::None};
 };
 
 struct StaticWallpaperSettings {
@@ -197,17 +239,27 @@ struct StaticWallpaperSettings {
     // UTF-8 directory used for new captures. Existing slideshow entries may
     // still point elsewhere and are never executed or interpreted as code.
     std::string storageDirectory;
+    SavedImageFormat savedImageFormat{SavedImageFormat::Png};
+    // Encoder quality/compression preference. JPEG uses it as image quality;
+    // lossless encoders use it as their available compression effort/profile.
+    int compressionQuality{90};
     std::vector<std::string> imagePaths;
 };
 
+struct VideoWallpaperSettings {
+    // UTF-8 path to an already exported local video. Desktop playback decodes
+    // this file and never invokes the fractal renderer.
+    std::string filePath;
+};
+
 struct AppSettings {
-    int schemaVersion{8};
+    int schemaVersion{12};
     std::string selectedPresetId{"full-view"};
     PerformanceSettings performance;
     GeneralSettings general;
     StaticWallpaperSettings staticWallpaper;
+    VideoWallpaperSettings videoWallpaper;
     MonitorMode monitorMode{MonitorMode::Mirror};
-    std::map<std::string, std::string> monitorPresetAssignments;
     std::vector<Preset> customPresets;
     std::vector<PalettePreset> customPalettePresets;
     std::vector<EquationPreset> customEquationPresets;
@@ -231,11 +283,14 @@ std::string ToString(PerformanceProfile value);
 std::string ToString(MonitorMode value);
 std::string ToString(PrecisionMode value);
 std::string ToString(StaticSlideshowOrder value);
+std::string ToString(SavedImageFormat value);
+std::string ToString(DesktopMode value);
 std::string ToString(EquationUnaryTransform value);
 std::string ToString(InitialZMode value);
 std::string ToString(FractalRenderMode value);
 std::string ToString(ColouringMethod value);
 std::string ToString(OrbitTrapType value);
+std::string ToString(PaletteInterpolation value);
 
 std::optional<AnimationMode> AnimationModeFromString(const std::string& value);
 std::optional<Palette> PaletteFromString(const std::string& value);
@@ -244,11 +299,14 @@ std::optional<PerformanceProfile> PerformanceProfileFromString(const std::string
 std::optional<MonitorMode> MonitorModeFromString(const std::string& value);
 std::optional<PrecisionMode> PrecisionModeFromString(const std::string& value);
 std::optional<StaticSlideshowOrder> StaticSlideshowOrderFromString(const std::string& value);
+std::optional<SavedImageFormat> SavedImageFormatFromString(const std::string& value);
+std::optional<DesktopMode> DesktopModeFromString(const std::string& value);
 std::optional<EquationUnaryTransform> EquationUnaryTransformFromString(const std::string& value);
 std::optional<InitialZMode> InitialZModeFromString(const std::string& value);
 std::optional<FractalRenderMode> FractalRenderModeFromString(const std::string& value);
 std::optional<ColouringMethod> ColouringMethodFromString(const std::string& value);
 std::optional<OrbitTrapType> OrbitTrapTypeFromString(const std::string& value);
+std::optional<PaletteInterpolation> PaletteInterpolationFromString(const std::string& value);
 
 PerformanceSettings SettingsForProfile(PerformanceProfile profile);
 std::vector<Colour> PalettePreviewColours(Palette palette);
@@ -257,6 +315,7 @@ std::string EquationSummary(const EquationSettings& equation);
 EquationSettings EquationExample(std::size_t index);
 std::vector<std::string> EquationExampleNames();
 ValidationResult ValidateAndNormalise(Preset& preset);
+[[nodiscard]] bool EnsureExactCamera(Preset& preset, std::string& error);
 ValidationResult ValidateAndNormalise(PalettePreset& preset);
 ValidationResult ValidateAndNormalise(EquationPreset& preset);
 ValidationResult ValidateAndNormalise(AppSettings& settings);

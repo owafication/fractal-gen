@@ -60,6 +60,10 @@ std::vector<AnimationController::JourneyPoint> AnimationController::ParseJourney
     return points;
 }
 
+bool AnimationController::HasValidJourneyScriptTargets(const std::string& script) {
+    return !ParseJourneyScript(script).empty();
+}
+
 AnimationController::AnimationController() {
     SetPreset(BuiltInPresets().front(), false);
 }
@@ -157,20 +161,32 @@ void AnimationController::SetManualCamera(const CameraState& camera) {
     NormaliseCamera(current_.camera);
 }
 
-void AnimationController::Pan(double normalisedDeltaX, double normalisedDeltaY, double aspectRatio) {
+void AnimationController::Pan(double normalisedDeltaX, double normalisedDeltaY, double aspectRatio,
+                              double rotationDegrees) {
     const double horizontalSpan = current_.camera.scale * aspectRatio * 2.0;
     const double verticalSpan = current_.camera.scale * 2.0;
-    OffsetCamera(current_.camera, -normalisedDeltaX * horizontalSpan, normalisedDeltaY * verticalSpan);
+    const double localX = -normalisedDeltaX * horizontalSpan;
+    const double localY = normalisedDeltaY * verticalSpan;
+    const double radians = rotationDegrees * 3.14159265358979323846 / 180.0;
+    const double cosine = std::cos(radians);
+    const double sine = std::sin(radians);
+    OffsetCamera(current_.camera, localX * cosine - localY * sine,
+                 localX * sine + localY * cosine);
     preset_.animationMode = AnimationMode::ManualView;
 }
 
-void AnimationController::ZoomAt(double normalisedX, double normalisedY, double wheelSteps, double aspectRatio) {
+void AnimationController::ZoomAt(double normalisedX, double normalisedY, double wheelSteps,
+                                 double aspectRatio, double rotationDegrees) {
     const double factor = std::pow(0.82, wheelSteps);
     const double oldScale = current_.camera.scale;
     const double newScale = std::clamp(oldScale * factor, 1.0e-32, 4.0);
-    OffsetCamera(current_.camera,
-                 normalisedX * (oldScale - newScale) * aspectRatio,
-                 normalisedY * (oldScale - newScale));
+    const double localX = normalisedX * (oldScale - newScale) * aspectRatio;
+    const double localY = normalisedY * (oldScale - newScale);
+    const double radians = rotationDegrees * 3.14159265358979323846 / 180.0;
+    const double cosine = std::cos(radians);
+    const double sine = std::sin(radians);
+    OffsetCamera(current_.camera, localX * cosine - localY * sine,
+                 localX * sine + localY * cosine);
     current_.camera.scale = newScale;
     preset_.animationMode = AnimationMode::ManualView;
 }

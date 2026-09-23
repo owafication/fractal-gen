@@ -9,7 +9,8 @@ Set-StrictMode -Version Latest
 $Root = Split-Path -Parent $PSScriptRoot
 $Build = Join-Path $Root 'build'
 $Dist = Join-Path $Root 'dist'
-$Version = '1.11.7'
+$Version = '1.13.1'
+$VersionCheckScript = Join-Path $Root 'cmake\VerifyVersionConsistency.cmake'
 
 function Invoke-Native {
     param([string]$FailureMessage, [scriptblock]$Command)
@@ -24,23 +25,39 @@ try {
     if (Test-Path $Build) { Remove-Item -Recurse -Force $Build }
     New-Item -ItemType Directory -Force -Path $Build, $Dist | Out-Null
 
-    Write-Host 'Configuring x64 Release build...'
+    Write-Host 'Checking release version consistency...'
+    Invoke-Native 'Version consistency check failed.' {
+        cmake "-DROOT_DIR=$Root" "-DEXPECTED_VERSION=$Version" -P $VersionCheckScript
+    }
+
+    Write-Host 'Configuring x64 Release build from CMakePresets.json...'
     Invoke-Native 'CMake configuration failed.' {
-        cmake -S . -B build -A x64 -DMW_BUILD_TESTS=ON -DMW_WARNINGS_AS_ERRORS=ON
+        cmake --preset windows-msvc-release
     }
 
     Write-Host 'Building...'
     Invoke-Native 'Build failed.' {
-        cmake --build build --config Release --parallel
+        cmake --build --preset windows-msvc-release --parallel
     }
 
-    Write-Host 'Running core tests...'
+    Write-Host 'Running core and release-gate tests...'
     Invoke-Native 'Tests failed.' {
-        ctest --test-dir build -C Release --output-on-failure
+        ctest --preset windows-msvc-release
     }
 
     $Exe = Join-Path $Build 'Release\MandelbrotWallpaper.exe'
     if (-not (Test-Path $Exe)) { throw "Expected executable was not produced: $Exe" }
+
+    $VersionInfo = (Get-Item $Exe).VersionInfo
+    $EmbeddedFileVersion = "$($VersionInfo.FileMajorPart).$($VersionInfo.FileMinorPart).$($VersionInfo.FileBuildPart)"
+    $EmbeddedProductVersion = "$($VersionInfo.ProductMajorPart).$($VersionInfo.ProductMinorPart).$($VersionInfo.ProductBuildPart)"
+    if ($EmbeddedFileVersion -ne $Version) {
+        throw "Executable file version mismatch. Expected $Version, found $EmbeddedFileVersion."
+    }
+    if ($EmbeddedProductVersion -ne $Version) {
+        throw "Executable product version mismatch. Expected $Version, found $EmbeddedProductVersion."
+    }
+    Write-Host "Embedded executable version verified: $Version"
 
     $Stage = Join-Path $Build 'package'
     if (Test-Path $Stage) { Remove-Item -Recurse -Force $Stage }
@@ -63,6 +80,11 @@ try {
             "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
             "$env:ProgramFiles\Inno Setup 6\ISCC.exe"
         ) | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
+        if ($null -eq $Iscc) {
+            $IsccCommand = Get-Command ISCC.exe -CommandType Application -ErrorAction SilentlyContinue |
+                Select-Object -First 1
+            if ($null -ne $IsccCommand) { $Iscc = $IsccCommand.Source }
+        }
         if ($null -ne $Iscc) {
             & $Iscc "/DSourceExe=$Exe" "/DOutputDir=$Dist" 'installer\MandelbrotWallpaper.iss'
             if ($LASTEXITCODE -ne 0) { throw "Installer build failed. Exit code: $LASTEXITCODE." }

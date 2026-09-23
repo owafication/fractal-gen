@@ -10,7 +10,7 @@
 namespace mw {
 
 namespace QuickControllerCommands {
-constexpr unsigned ApplySettingsLive = 43002;
+constexpr unsigned VideoDesktop = 43002;
 constexpr unsigned SaveImage = 43003;
 constexpr unsigned LoadPreset = 43004;
 constexpr unsigned Edit = 43005;
@@ -20,10 +20,9 @@ constexpr unsigned TogglePreviewColours = 43008;
 constexpr unsigned CopyCoordinates = 43009;
 constexpr unsigned ExitApp = 43010;
 constexpr unsigned JumpToCoordinates = 43012;
-constexpr unsigned ToggleDesktopZoom = 43013;
-constexpr unsigned ToggleDesktopColours = 43014;
 constexpr unsigned SlideshowDesktop = 43015;
 constexpr unsigned RenderHighRes = 43016;
+constexpr unsigned JourneySettings = 43017;
 }
 
 class QuickControllerWindow {
@@ -34,9 +33,9 @@ public:
     void Hide();
     void Update(const std::wstring& status, const std::wstring& coordinates,
                 const std::wstring& resources,
-                bool previewZoomMotionEnabled, bool previewColourCyclingEnabled,
-                bool desktopZoomMotionEnabled, bool desktopColourCyclingEnabled);
+                bool previewZoomMotionEnabled, bool previewColourCyclingEnabled);
     [[nodiscard]] bool IsVisible() const noexcept;
+    [[nodiscard]] HWND Window() const noexcept { return window_; }
     void Destroy();
     bool ProcessDialogMessage(MSG& message);
 #endif
@@ -53,18 +52,17 @@ private:
     HWND statusLabel_{nullptr};
     HWND coordinatesLabel_{nullptr};
     HWND resourcesLabel_{nullptr};
-    HWND applyLiveButton_{nullptr};
+    HWND videoDesktopButton_{nullptr};
     HWND staticDesktopButton_{nullptr};
     HWND slideshowDesktopButton_{nullptr};
     HWND previewZoomButton_{nullptr};
     HWND previewColourButton_{nullptr};
     HWND jumpCoordinatesButton_{nullptr};
-    HWND desktopZoomButton_{nullptr};
-    HWND desktopColourButton_{nullptr};
     HWND saveImageButton_{nullptr};
     HWND renderHighResButton_{nullptr};
     HWND copyCoordinatesButton_{nullptr};
     HWND loadPresetButton_{nullptr};
+    HWND journeySettingsButton_{nullptr};
     HWND editButton_{nullptr};
     HWND exitButton_{nullptr};
     HFONT font_{nullptr};

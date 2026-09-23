@@ -62,7 +62,9 @@ private:
     unsigned doubleProgram_{0};
     unsigned postProcessProgram_{0};
     unsigned framebuffer_{0};
+    unsigned blurFramebuffer_{0};
     unsigned renderTexture_{0};
+    unsigned blurTexture_{0};
     unsigned customPaletteTexture_{0};
     unsigned referenceOrbitRealTexture_{0};
     unsigned referenceOrbitImaginaryTexture_{0};
@@ -70,6 +72,9 @@ private:
     std::string referenceOrbitKey_;
     int referenceOrbitLength_{0};
     float postProcessGlowStrength_{0.0F};
+    float postProcessBloomThreshold_{0.22F};
+    float postProcessBloomSoftKnee_{0.0F};
+    int postProcessBloomRadius_{1};
 
     using GLCreateShader = unsigned(APIENTRY*)(unsigned);
     using GLShaderSource = void(APIENTRY*)(unsigned, int, const char* const*, const int*);

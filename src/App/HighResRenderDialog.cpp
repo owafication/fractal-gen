@@ -3,13 +3,15 @@
 #include "App/DialogSupport.h"
 #include "Core/StillImageRenderer.h"
 #include "Core/DeepZoom.h"
+#include "Core/Precision/ExactCameraAdapter.h"
+#include "Core/Precision/PrecisionPlanner.h"
 #include "Rendering/GpuRenderer.h"
+#include "WindowsIntegration/ImageCodec.h"
 
 #ifdef _WIN32
 #include <commctrl.h>
 #include <commdlg.h>
-#include <wincodec.h>
-#include <wrl/client.h>
+#include <objbase.h>
 #endif
 
 #include <algorithm>
@@ -34,8 +36,6 @@ namespace mw {
 #ifdef _WIN32
 namespace {
 
-using Microsoft::WRL::ComPtr;
-
 constexpr wchar_t kClassName[] = L"MandelbrotHighResRenderDialog";
 constexpr wchar_t kPreviewClassName[] = L"MandelbrotHighResPreviewWindow";
 constexpr UINT kRenderProgressMessage = WM_APP + 201U;
@@ -57,7 +57,6 @@ enum Id : int {
     CloseButton,
 };
 
-enum class ImageFormat { Png, Tiff, Bmp };
 enum class RenderBackend { GpuDirect3D11, GpuOpenGl, CpuTiled };
 
 struct PreviewWindowState {
@@ -70,6 +69,7 @@ struct State {
     HINSTANCE instance{};
     Preset snapshot;
     PerformanceSettings performance;
+    StaticWallpaperSettings outputSettings;
     HFONT font{};
     ResponsiveDialogLayout layout;
     UINT dpi{96};
@@ -84,7 +84,7 @@ struct State {
     std::string workerError;
     StillRenderResult completedResult;
     std::filesystem::path completedPath;
-    ImageFormat completedFormat{ImageFormat::Png};
+    SavedImageFormat completedFormat{SavedImageFormat::Png};
     std::uint32_t completedWidth{0};
     std::uint32_t completedHeight{0};
     std::uint32_t completedDpi{0};
@@ -125,42 +125,41 @@ std::wstring GetText(HWND control) {
     return text;
 }
 
-std::wstring MakeCoordinateString(const CameraState& camera) {
+std::wstring MakeCoordinateString(const Preset& preset) {
+    if (preset.exactCamera) {
+        return ToWide(preset.exactCamera->centreX.CanonicalText() + "," +
+                      preset.exactCamera->centreY.CanonicalText() + "," +
+                      preset.exactCamera->halfHeight.CanonicalText());
+    }
     std::wostringstream stream;
     stream << std::setprecision(17)
-           << CameraCentreX(camera) << L"," << CameraCentreY(camera) << L"," << camera.scale;
+           << CameraCentreX(preset.camera) << L"," << CameraCentreY(preset.camera) << L"," <<
+        preset.camera.scale;
     return stream.str();
 }
 
-bool ParseCoordinateString(const std::wstring& text, CameraState& camera) {
+bool ParseCoordinateString(const std::wstring& text, ExactCamera& camera, std::string& error) {
     std::wstring copy = text;
     for (wchar_t& character : copy) {
         if (character == L';' || character == L'|') character = L',';
     }
     std::wstringstream stream(copy);
     std::wstring part;
-    std::array<double, 3> values{};
+    std::array<ExactDecimal*, 3> values{{&camera.centreX, &camera.centreY, &camera.halfHeight}};
     std::size_t count = 0U;
     while (std::getline(stream, part, L',')) {
         if (part.find_first_not_of(L" \t\r\n") == std::wstring::npos) continue;
-        if (count >= values.size()) return false;
-        try {
-            std::size_t consumed = 0U;
-            values[count] = std::stod(part, &consumed);
-            if (part.find_first_not_of(L" \t\r\n", consumed) != std::wstring::npos) return false;
-        } catch (...) {
-            return false;
-        }
+        const auto first = part.find_first_not_of(L" \t\r\n");
+        const auto last = part.find_last_not_of(L" \t\r\n");
+        part = part.substr(first, last - first + 1U);
+        if (count >= values.size() || part.find_first_of(L"\x80-\xffff") != std::wstring::npos) return false;
+        std::string ascii;
+        ascii.reserve(part.size());
+        for (const wchar_t character : part) ascii.push_back(static_cast<char>(character));
+        if (!ExactDecimal::Parse(ascii, *values[count], error)) return false;
         ++count;
     }
-    if (count != values.size()) return false;
-    camera.centreX = values[0];
-    camera.centreY = values[1];
-    camera.centreXLow = 0.0;
-    camera.centreYLow = 0.0;
-    camera.scale = values[2];
-    return std::isfinite(camera.centreX) && std::isfinite(camera.centreY) &&
-           std::isfinite(camera.scale) && camera.scale > 0.0;
+    return count == values.size() && !camera.halfHeight.IsZero();
 }
 
 bool ParsePositiveUInt32(HWND control, std::uint32_t& value) {
@@ -179,39 +178,33 @@ bool ParsePositiveUInt32(HWND control, std::uint32_t& value) {
     }
 }
 
-const wchar_t* FormatName(ImageFormat format) {
+const wchar_t* FormatName(SavedImageFormat format) {
     switch (format) {
-    case ImageFormat::Png: return L"PNG";
-    case ImageFormat::Tiff: return L"TIFF";
-    case ImageFormat::Bmp: return L"BMP";
+    case SavedImageFormat::Png: return L"PNG";
+    case SavedImageFormat::Jpeg: return L"JPEG";
+    case SavedImageFormat::Tiff: return L"TIFF";
+    case SavedImageFormat::Bmp: return L"BMP";
     }
     return L"PNG";
 }
 
-const wchar_t* FormatExtension(ImageFormat format) {
+const wchar_t* FormatExtension(SavedImageFormat format) {
     switch (format) {
-    case ImageFormat::Png: return L"png";
-    case ImageFormat::Tiff: return L"tiff";
-    case ImageFormat::Bmp: return L"bmp";
+    case SavedImageFormat::Png: return L"png";
+    case SavedImageFormat::Jpeg: return L"jpg";
+    case SavedImageFormat::Tiff: return L"tiff";
+    case SavedImageFormat::Bmp: return L"bmp";
     }
     return L"png";
 }
 
-const GUID& ContainerGuid(ImageFormat format) {
-    switch (format) {
-    case ImageFormat::Png: return GUID_ContainerFormatPng;
-    case ImageFormat::Tiff: return GUID_ContainerFormatTiff;
-    case ImageFormat::Bmp: return GUID_ContainerFormatBmp;
-    }
-    return GUID_ContainerFormatPng;
-}
-
-ImageFormat SelectedFormat(HWND window) {
+SavedImageFormat SelectedFormat(HWND window) {
     const int selected = static_cast<int>(SendMessageW(
         GetDlgItem(window, FormatCombo), CB_GETCURSEL, 0, 0));
-    if (selected == 1) return ImageFormat::Tiff;
-    if (selected == 2) return ImageFormat::Bmp;
-    return ImageFormat::Png;
+    if (selected == 1) return SavedImageFormat::Jpeg;
+    if (selected == 2) return SavedImageFormat::Tiff;
+    if (selected == 3) return SavedImageFormat::Bmp;
+    return SavedImageFormat::Png;
 }
 
 RenderBackend SelectedBackend(HWND window) {
@@ -222,7 +215,9 @@ RenderBackend SelectedBackend(HWND window) {
     return RenderBackend::GpuDirect3D11;
 }
 
-std::wstring BackendStatus(RenderBackend backend) {
+std::wstring BackendStatus(RenderBackend backend, bool exactDirect = false) {
+    if (exactDirect)
+        return L"Rendering in the background using the exact CPU direct evaluator...";
     if (backend == RenderBackend::GpuDirect3D11)
         return L"Rendering in the background using GPU Direct3D 11 tiles...";
     if (backend == RenderBackend::GpuOpenGl)
@@ -257,11 +252,15 @@ RenderRegion BuildRenderRegion(const Preset& preset, std::uint32_t width, std::u
     RenderRegion region;
     region.pixels = RECT{0, 0, static_cast<LONG>(std::min<std::uint32_t>(width, static_cast<std::uint32_t>(std::numeric_limits<LONG>::max()))), static_cast<LONG>(std::min<std::uint32_t>(height, static_cast<std::uint32_t>(std::numeric_limits<LONG>::max())))};
     region.camera = preset.camera;
+    region.rotationDegrees = preset.rotationDegrees;
     region.palette = preset.palette;
     region.customPaletteColours = preset.customPaletteColours;
     region.maximumIterations = preset.maximumIterations;
     region.equation = preset.equation;
     region.colourOffset = preset.colourOffset;
+    region.paletteFrequency = preset.paletteFrequency;
+    region.paletteGamma = preset.paletteGamma;
+    region.paletteInterpolation = preset.paletteInterpolation;
     region.brightness = preset.brightness;
     region.contrast = preset.contrast;
     region.saturation = preset.saturation;
@@ -291,130 +290,12 @@ bool EnsureHiddenGpuHostClass(HINSTANCE instance) {
     return true;
 }
 
-class WicRowEncoder {
-public:
-    bool Initialise(const std::filesystem::path& path, ImageFormat format,
-                    std::uint32_t width, std::uint32_t height, std::uint32_t dpi,
-                    std::string& error) {
-        if (width > std::numeric_limits<UINT>::max() / 3U) {
-            error = "The requested width exceeds the encoder scanline limit.";
-            return false;
-        }
-        const HRESULT factoryResult = CoCreateInstance(
-            CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
-            IID_PPV_ARGS(factory_.ReleaseAndGetAddressOf()));
-        if (FAILED(factoryResult)) {
-            error = "Windows Imaging Component could not start.";
-            return false;
-        }
-        HRESULT result = factory_->CreateStream(stream_.ReleaseAndGetAddressOf());
-        if (FAILED(result)) {
-            error = "The image output stream could not be created.";
-            return false;
-        }
-        result = stream_->InitializeFromFilename(path.c_str(), GENERIC_WRITE);
-        if (FAILED(result)) {
-            error = "The temporary image file could not be opened for writing.";
-            return false;
-        }
-        result = factory_->CreateEncoder(ContainerGuid(format), nullptr,
-                                         encoder_.ReleaseAndGetAddressOf());
-        if (FAILED(result)) {
-            error = "The selected Windows image encoder is unavailable.";
-            return false;
-        }
-        result = encoder_->Initialize(stream_.Get(), WICBitmapEncoderNoCache);
-        if (FAILED(result)) {
-            error = "The selected image encoder could not initialise.";
-            return false;
-        }
-        ComPtr<IPropertyBag2> options;
-        result = encoder_->CreateNewFrame(frame_.ReleaseAndGetAddressOf(),
-                                          options.ReleaseAndGetAddressOf());
-        if (FAILED(result)) {
-            error = "The encoded image frame could not be created.";
-            return false;
-        }
-        result = frame_->Initialize(options.Get());
-        if (FAILED(result)) {
-            error = "The encoded image frame could not initialise.";
-            return false;
-        }
-        result = frame_->SetSize(width, height);
-        if (FAILED(result)) {
-            error = "The selected encoder rejected the requested resolution.";
-            return false;
-        }
-        result = frame_->SetResolution(static_cast<double>(dpi), static_cast<double>(dpi));
-        if (FAILED(result)) {
-            error = "The selected encoder rejected the requested DPI metadata.";
-            return false;
-        }
-        WICPixelFormatGUID pixelFormat = GUID_WICPixelFormat24bppBGR;
-        result = frame_->SetPixelFormat(&pixelFormat);
-        if (FAILED(result) || !IsEqualGUID(pixelFormat, GUID_WICPixelFormat24bppBGR)) {
-            error = "The selected encoder does not support the required BGR pixel format.";
-            return false;
-        }
-        width_ = width;
-        stride_ = width * 3U;
-        bgrRow_.resize(static_cast<std::size_t>(stride_));
-        return true;
-    }
-
-    bool WriteRow(std::span<const std::uint32_t> pixels, std::string& error) {
-        if (!frame_ || pixels.size() != width_) {
-            error = "The encoder received an invalid scanline.";
-            return false;
-        }
-        for (std::size_t index = 0U; index < pixels.size(); ++index) {
-            const std::uint32_t pixel = pixels[index];
-            const std::size_t offset = index * 3U;
-            bgrRow_[offset] = static_cast<BYTE>(pixel & 0xFFU);
-            bgrRow_[offset + 1U] = static_cast<BYTE>((pixel >> 8U) & 0xFFU);
-            bgrRow_[offset + 2U] = static_cast<BYTE>((pixel >> 16U) & 0xFFU);
-        }
-        const HRESULT result = frame_->WritePixels(1U, stride_, stride_, bgrRow_.data());
-        if (FAILED(result)) {
-            error = "The image encoder could not write an output scanline.";
-            return false;
-        }
-        return true;
-    }
-
-    bool Commit(std::string& error) {
-        if (!frame_ || !encoder_) {
-            error = "The image encoder was not ready to commit.";
-            return false;
-        }
-        HRESULT result = frame_->Commit();
-        if (FAILED(result)) {
-            error = "The encoded image frame could not be finalised.";
-            return false;
-        }
-        result = encoder_->Commit();
-        if (FAILED(result)) {
-            error = "The encoded image file could not be finalised.";
-            return false;
-        }
-        return true;
-    }
-
-private:
-    ComPtr<IWICImagingFactory> factory_;
-    ComPtr<IWICStream> stream_;
-    ComPtr<IWICBitmapEncoder> encoder_;
-    ComPtr<IWICBitmapFrameEncode> frame_;
-    std::vector<BYTE> bgrRow_;
-    std::uint32_t width_{0};
-    UINT stride_{0};
-};
-
 bool RenderStillImageGpu(HINSTANCE instance, GpuBackendPreference backendPreference,
                          const StillRenderRequest& request,
                          const PerformanceSettings& performance,
-                         const std::filesystem::path& outputPath, ImageFormat format,
-                         std::uint32_t dpi, std::atomic_bool& cancelRequested,
+                         const std::filesystem::path& outputPath, SavedImageFormat format,
+                         int stateCompressionQuality, std::uint32_t dpi,
+                         std::atomic_bool& cancelRequested,
                          const std::function<void(unsigned)>& progressCallback,
                          StillRenderResult& result, std::string& error) {
     result = {};
@@ -462,7 +343,7 @@ bool RenderStillImageGpu(HINSTANCE instance, GpuBackendPreference backendPrefere
     }
 
     const int deviceLimit = renderer.MaximumRenderDimension();
-    constexpr std::uint32_t overlapPixels = 1U;
+    const std::uint32_t overlapPixels = StillRenderTileOverlapPixels(request.preset);
     if (deviceLimit <= static_cast<int>(overlapPixels * 2U)) {
         renderer.Shutdown();
         host.Reset();
@@ -487,7 +368,7 @@ bool RenderStillImageGpu(HINSTANCE instance, GpuBackendPreference backendPrefere
                                   static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max()))))});
 
     WicRowEncoder encoder;
-    if (!encoder.Initialise(outputPath, format, request.width, request.height, dpi, error)) {
+    if (!encoder.Initialise(outputPath, format, stateCompressionQuality, request.width, request.height, dpi, error)) {
         renderer.Shutdown();
         host.Reset();
         return false;
@@ -599,7 +480,8 @@ bool RenderStillImageGpu(HINSTANCE instance, GpuBackendPreference backendPrefere
             Preset tilePreset = qualityPreset;
             tilePreset.camera = CameraForStillRenderTile(
                 qualityPreset.camera, request.width, request.height,
-                renderX, renderY, renderWidth, renderHeight);
+                renderX, renderY, renderWidth, renderHeight,
+                qualityPreset.rotationDegrees);
             regions[0] = BuildRenderRegion(tilePreset, renderWidth, renderHeight);
             rendererError.clear();
             if (!renderer.Render(regions, options, rendererError)) {
@@ -706,7 +588,7 @@ bool RenderStillImageGpu(HINSTANCE instance, GpuBackendPreference backendPrefere
     return true;
 }
 
-std::filesystem::path MakeTemporaryPath(ImageFormat format) {
+std::filesystem::path MakeTemporaryPath(SavedImageFormat format) {
     std::error_code error;
     std::filesystem::path folder = std::filesystem::temp_directory_path(error);
     if (error) folder = std::filesystem::current_path(error);
@@ -784,9 +666,48 @@ void FinishRender(State& state) {
 
 bool StartRender(State& state) {
     if (state.rendering) return false;
-    CameraState camera = state.snapshot.camera;
-    if (!ParseCoordinateString(GetText(GetDlgItem(state.window, CoordinatesEdit)), camera)) {
+    ExactCamera exactCamera;
+    std::string exactCameraError;
+    if (!ParseCoordinateString(GetText(GetDlgItem(state.window, CoordinatesEdit)), exactCamera,
+                               exactCameraError)) {
         MessageBoxW(state.window, L"Use the coordinate format centreX,centreY,scale.",
+                    L"Render Hi-Res", MB_OK | MB_ICONERROR);
+        return false;
+    }
+    const RenderBackend backend = SelectedBackend(state.window);
+    PrecisionBackendCapabilities plannerCapabilities;
+    plannerCapabilities.cpuBoost512Reference = backend == RenderBackend::CpuTiled;
+    plannerCapabilities.cpuBoost2048Direct = backend == RenderBackend::CpuTiled;
+    plannerCapabilities.cpuBoost8192Direct = backend == RenderBackend::CpuTiled;
+    plannerCapabilities.cpuBoost16384Direct = backend == RenderBackend::CpuTiled;
+    const PrecisionPlan precisionPlan = BuildPrecisionPlan(
+        exactCamera, state.snapshot.equation, state.performance.precision.mode, plannerCapabilities);
+    if (precisionPlan.backend == PrecisionExecutionBackend::Refused) {
+        MessageBoxW(state.window,
+                    ToWide("The current high-resolution renderer cannot execute this exact camera safely. " +
+                           precisionPlan.reason).c_str(),
+                    L"Render Hi-Res", MB_OK | MB_ICONERROR);
+        return false;
+    }
+    const bool useExactDirect = precisionPlan.backend ==
+        PrecisionExecutionBackend::CpuBoost512Reference ||
+        precisionPlan.backend == PrecisionExecutionBackend::CpuBoost2048Direct ||
+        precisionPlan.backend == PrecisionExecutionBackend::CpuBoost8192Direct ||
+        precisionPlan.backend == PrecisionExecutionBackend::CpuBoost16384Direct;
+    if (useExactDirect && (backend != RenderBackend::CpuTiled ||
+                           state.snapshot.rotationDegrees != 0.0 ||
+                           state.snapshot.equation.animateCoefficients ||
+                           state.snapshot.antiAliasingLevel < 1 ||
+                           state.snapshot.antiAliasingLevel > 4)) {
+        MessageBoxW(state.window,
+                    L"The current exact CPU renderer requires CPU selection, zero rotation, static equation coefficients and anti-aliasing level 1 through 4.",
+                    L"Render Hi-Res", MB_OK | MB_ICONERROR);
+        return false;
+    }
+    LegacyCameraAdaptation camera;
+    if (!useExactDirect && (!AdaptExactCameraToLegacy(exactCamera, camera, exactCameraError) ||
+                            camera.camera.scale <= 0.0)) {
+        MessageBoxW(state.window, L"The exact coordinates cannot be represented by the selected renderer.",
                     L"Render Hi-Res", MB_OK | MB_ICONERROR);
         return false;
     }
@@ -810,12 +731,12 @@ bool StartRender(State& state) {
     state.workerCancelled = false;
     state.workerError.clear();
     state.cancelRequested.store(false);
-    const ImageFormat format = SelectedFormat(state.window);
-    const RenderBackend backend = SelectedBackend(state.window);
+    const SavedImageFormat format = SelectedFormat(state.window);
     const std::filesystem::path outputPath = MakeTemporaryPath(format);
 
     Preset snapshot = state.snapshot;
-    snapshot.camera = camera;
+    if (!useExactDirect) snapshot.camera = camera.camera;
+    snapshot.exactCamera = std::move(exactCamera);
     ValidateAndNormalise(snapshot);
     StillRenderRequest request;
     request.preset = snapshot;
@@ -828,15 +749,25 @@ bool StartRender(State& state) {
         std::chrono::duration<double>(
             std::chrono::steady_clock::now().time_since_epoch()).count(),
         100000.0);
+    ExactDirectStillRenderRequest exactDirectRequest;
+    if (useExactDirect) {
+        exactDirectRequest.preset = snapshot;
+        exactDirectRequest.camera = *snapshot.exactCamera;
+        exactDirectRequest.width = width;
+        exactDirectRequest.height = height;
+        exactDirectRequest.maximumIterations = std::clamp(snapshot.maximumIterations, 32, 4096);
+        exactDirectRequest.precisionBits = precisionPlan.selectedBits;
+    }
 
     state.rendering = true;
     SetInputEnabled(state, false);
     SendMessageW(GetDlgItem(state.window, ProgressBar), PBM_SETPOS, 0, 0);
-    SetStatus(state, BackendStatus(backend));
+    SetStatus(state, BackendStatus(backend, useExactDirect));
 
     State* statePointer = &state;
     try {
-        state.worker = std::thread([statePointer, request, outputPath, format, backend, width, height, dpi]() {
+        state.worker = std::thread([statePointer, request, exactDirectRequest, useExactDirect,
+                                    outputPath, format, backend, width, height, dpi]() {
             const HRESULT comResult = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
             const bool comInitialised = SUCCEEDED(comResult);
             std::string error;
@@ -857,14 +788,34 @@ bool StartRender(State& state) {
                             ? GpuBackendPreference::Direct3D11
                             : GpuBackendPreference::OpenGL;
                         succeeded = RenderStillImageGpu(statePointer->instance, gpuPreference, request, statePointer->performance,
-                                                        outputPath, format, dpi, statePointer->cancelRequested,
-                                                        postPermille, renderResult, error);
+                                                        outputPath, format, statePointer->outputSettings.compressionQuality,
+                                                        dpi, statePointer->cancelRequested, postPermille, renderResult, error);
                         cancelled = statePointer->cancelRequested.load() || error == "Still render cancelled.";
                     } else {
                         WicRowEncoder encoder;
-                        if (encoder.Initialise(outputPath, format, width, height, dpi, error)) {
+                        if (encoder.Initialise(outputPath, format, statePointer->outputSettings.compressionQuality, width, height, dpi, error)) {
                             unsigned lastPermille = 0U;
-                            const bool rendered = RenderStillImageTiled(
+                            const bool rendered = useExactDirect
+                                ? RenderExactDirectStillImage(
+                                exactDirectRequest,
+                                [&encoder](std::uint32_t, std::span<const std::uint32_t> row,
+                                           std::string& writerError) {
+                                    return encoder.WriteRow(row, writerError);
+                                },
+                                [statePointer, &lastPermille](const StillRenderProgress& progress) {
+                                    const unsigned permille = progress.totalRows == 0U ? 0U :
+                                        static_cast<unsigned>((static_cast<std::uint64_t>(progress.completedRows) *
+                                                                 1000ULL) / progress.totalRows);
+                                    if (permille != lastPermille || progress.completedRows == progress.totalRows) {
+                                        lastPermille = permille;
+                                        PostMessageW(statePointer->window, kRenderProgressMessage,
+                                                     static_cast<WPARAM>(permille),
+                                                     static_cast<LPARAM>(progress.completedRows));
+                                    }
+                                },
+                                [statePointer]() { return statePointer->cancelRequested.load(); },
+                                renderResult, error)
+                                : RenderStillImageTiled(
                                 request,
                                 [&encoder](std::uint32_t, std::span<const std::uint32_t> row,
                                            std::string& writerError) {
@@ -888,7 +839,8 @@ bool StartRender(State& state) {
                                 renderResult,
                                 error);
                             cancelled = statePointer->cancelRequested.load() ||
-                                        error == "Still render cancelled.";
+                                        error == "Still render cancelled." ||
+                                        error == "Exact direct still rendering was cancelled.";
                             if (rendered && !cancelled) succeeded = encoder.Commit(error);
                         }
                     }
@@ -930,7 +882,7 @@ bool StartRender(State& state) {
     return true;
 }
 
-std::wstring SaveFileDialog(HWND owner, ImageFormat format) {
+std::wstring SaveFileDialog(HWND owner, SavedImageFormat format, const std::string& defaultDirectoryUtf8) {
     wchar_t fileName[MAX_PATH]{};
     std::wstring defaultName = L"mandelbrot-hires.";
     defaultName += FormatExtension(format);
@@ -938,9 +890,10 @@ std::wstring SaveFileDialog(HWND owner, ImageFormat format) {
 
     const wchar_t* filter = nullptr;
     switch (format) {
-    case ImageFormat::Png: filter = L"PNG image (*.png)\0*.png\0All files (*.*)\0*.*\0"; break;
-    case ImageFormat::Tiff: filter = L"TIFF image (*.tif;*.tiff)\0*.tif;*.tiff\0All files (*.*)\0*.*\0"; break;
-    case ImageFormat::Bmp: filter = L"Bitmap image (*.bmp)\0*.bmp\0All files (*.*)\0*.*\0"; break;
+    case SavedImageFormat::Png: filter = L"PNG image (*.png)\0*.png\0All files (*.*)\0*.*\0"; break;
+    case SavedImageFormat::Jpeg: filter = L"JPEG image (*.jpg;*.jpeg)\0*.jpg;*.jpeg\0All files (*.*)\0*.*\0"; break;
+    case SavedImageFormat::Tiff: filter = L"TIFF image (*.tif;*.tiff)\0*.tif;*.tiff\0All files (*.*)\0*.*\0"; break;
+    case SavedImageFormat::Bmp: filter = L"Bitmap image (*.bmp)\0*.bmp\0All files (*.*)\0*.*\0"; break;
     }
     OPENFILENAMEW dialog{};
     dialog.lStructSize = sizeof(dialog);
@@ -950,18 +903,21 @@ std::wstring SaveFileDialog(HWND owner, ImageFormat format) {
     dialog.nMaxFile = MAX_PATH;
     dialog.Flags = OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR | OFN_OVERWRITEPROMPT;
     dialog.lpstrDefExt = FormatExtension(format);
+    const std::wstring initialDirectory = ToWide(defaultDirectoryUtf8);
+    if (!initialDirectory.empty()) dialog.lpstrInitialDir = initialDirectory.c_str();
     return GetSaveFileNameW(&dialog) ? std::wstring(fileName) : std::wstring{};
 }
 
 
-std::filesystem::path NormaliseSavedPath(const std::wstring& selected, ImageFormat format) {
+std::filesystem::path NormaliseSavedPath(const std::wstring& selected, SavedImageFormat format) {
     std::filesystem::path path(selected);
     std::wstring extension = path.extension().wstring();
     std::transform(extension.begin(), extension.end(), extension.begin(),
                    [](wchar_t character) { return static_cast<wchar_t>(std::towlower(character)); });
     bool valid = false;
-    if (format == ImageFormat::Png) valid = extension == L".png";
-    else if (format == ImageFormat::Tiff) valid = extension == L".tif" || extension == L".tiff";
+    if (format == SavedImageFormat::Png) valid = extension == L".png";
+    else if (format == SavedImageFormat::Jpeg) valid = extension == L".jpg" || extension == L".jpeg";
+    else if (format == SavedImageFormat::Tiff) valid = extension == L".tif" || extension == L".tiff";
     else valid = extension == L".bmp";
     if (!valid) path.replace_extension(FormatExtension(format));
     return path;
@@ -969,7 +925,7 @@ std::filesystem::path NormaliseSavedPath(const std::wstring& selected, ImageForm
 
 void SaveCompletedOutput(State& state) {
     if (!state.rendered || state.completedPath.empty()) return;
-    const std::wstring selected = SaveFileDialog(state.window, state.completedFormat);
+    const std::wstring selected = SaveFileDialog(state.window, state.completedFormat, state.outputSettings.storageDirectory);
     if (selected.empty()) return;
     const std::filesystem::path targetPath =
         NormaliseSavedPath(selected, state.completedFormat);
@@ -1103,7 +1059,7 @@ LRESULT CALLBACK Procedure(HWND window, UINT message, WPARAM wParam, LPARAM lPar
         state->font = CreateResponsiveDialogFont(state->dpi);
         int y = 18;
         Add(*state, WC_STATICW, L"Coordinate string", SS_LEFT, 0, 18, y + 4, 140, 20);
-        Add(*state, WC_EDITW, MakeCoordinateString(state->snapshot.camera).c_str(),
+        Add(*state, WC_EDITW, MakeCoordinateString(state->snapshot).c_str(),
             ES_AUTOHSCROLL | WS_TABSTOP, CoordinatesEdit, 160, y, 450, 26);
         y += 38;
         Add(*state, WC_STATICW, L"Width", SS_LEFT, 0, 18, y + 4, 140, 20);
@@ -1120,10 +1076,10 @@ LRESULT CALLBACK Procedure(HWND window, UINT message, WPARAM wParam, LPARAM lPar
         HWND formatCombo = Add(*state, WC_COMBOBOXW, L"",
                                CBS_DROPDOWNLIST | WS_TABSTOP, FormatCombo,
                                414, y, 196, 150);
-        for (const wchar_t* name : {L"PNG - lossless", L"TIFF - lossless", L"BMP - uncompressed"}) {
+        for (const wchar_t* name : {L"PNG - lossless", L"JPEG - quality controlled", L"TIFF - compressed", L"BMP - uncompressed"}) {
             SendMessageW(formatCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(name));
         }
-        SendMessageW(formatCombo, CB_SETCURSEL, 0, 0);
+        SendMessageW(formatCombo, CB_SETCURSEL, static_cast<WPARAM>(state->outputSettings.savedImageFormat), 0);
         y += 38;
         Add(*state, WC_STATICW, L"Renderer", SS_LEFT, 0, 18, y + 4, 140, 20);
         HWND backendCombo = Add(*state, WC_COMBOBOXW, L"",
@@ -1242,7 +1198,9 @@ LRESULT CALLBACK Procedure(HWND window, UINT message, WPARAM wParam, LPARAM lPar
 
 } // namespace
 
-void HighResRenderDialog::Show(HWND owner, HINSTANCE instance, const Preset& snapshot, const PerformanceSettings& performance) {
+void HighResRenderDialog::Show(HWND owner, HINSTANCE instance, const Preset& snapshot,
+                               const PerformanceSettings& performance,
+                               const StaticWallpaperSettings& outputSettings) {
     WNDCLASSEXW windowClass{};
     windowClass.cbSize = sizeof(windowClass);
     windowClass.lpfnWndProc = Procedure;
@@ -1257,6 +1215,7 @@ void HighResRenderDialog::Show(HWND owner, HINSTANCE instance, const Preset& sna
     state.instance = instance;
     state.snapshot = snapshot;
     state.performance = performance;
+    state.outputSettings = outputSettings;
     state.dpi = DialogDpi(owner);
     const RECT dialogRect = ResponsiveDialogRect(owner, 680, 500, state.dpi, kClassName);
     HWND window = CreateWindowExW(

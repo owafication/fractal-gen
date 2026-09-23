@@ -1,6 +1,7 @@
 #include "Core/SettingsStore.h"
 
 #include "Core/Json.h"
+#include "Core/Precision/ExactCameraAdapter.h"
 
 #include <chrono>
 #include <fstream>
@@ -65,7 +66,16 @@ Value EquationToJson(const EquationSettings& equation) {
         {"orbitTrapPoint", ComplexCoefficientToJson(equation.orbitTrapPoint)},
         {"orbitTrapRadius", equation.orbitTrapRadius},
         {"glowStrength", equation.glowStrength},
+        {"bloomThreshold", equation.bloomThreshold},
+        {"bloomSoftKnee", equation.bloomSoftKnee},
+        {"bloomRadius", equation.bloomRadius},
+        {"edgeLightingStrength", equation.edgeLightingStrength},
         {"depthStrength", equation.depthStrength},
+        {"stripeAverageEnabled", equation.stripeAverageEnabled},
+        {"stripeDensity", equation.stripeDensity},
+        {"stripePhase", equation.stripePhase},
+        {"stripeStrength", equation.stripeStrength},
+        {"stripeStartIteration", equation.stripeStartIteration},
         {"animateCoefficients", equation.animateCoefficients},
         {"coefficientAnimationSpeed", equation.coefficientAnimationSpeed},
         {"coefficientAnimationAmplitude", equation.coefficientAnimationAmplitude},
@@ -136,7 +146,24 @@ bool EquationFromJson(const Value* value, EquationSettings& equation, std::strin
     }
     if (const auto* child = value->Find("orbitTrapRadius")) equation.orbitTrapRadius = child->AsNumber(equation.orbitTrapRadius);
     if (const auto* child = value->Find("glowStrength")) equation.glowStrength = child->AsNumber(equation.glowStrength);
+    if (const auto* child = value->Find("bloomThreshold")) equation.bloomThreshold = child->AsNumber(equation.bloomThreshold);
+    if (const auto* child = value->Find("bloomSoftKnee")) equation.bloomSoftKnee = child->AsNumber(equation.bloomSoftKnee);
+    if (const auto* child = value->Find("bloomRadius")) equation.bloomRadius = child->AsInt(equation.bloomRadius);
+    if (const auto* child = value->Find("edgeLightingStrength")) {
+        equation.edgeLightingStrength = child->AsNumber(equation.edgeLightingStrength);
+    } else {
+        // Before 1.12.1 glowStrength drove both the narrow mathematical feature
+        // highlight and screen-space bloom. Copy it once during migration so
+        // older custom presets preserve their appearance and can then be edited
+        // independently.
+        equation.edgeLightingStrength = equation.glowStrength;
+    }
     if (const auto* child = value->Find("depthStrength")) equation.depthStrength = child->AsNumber(equation.depthStrength);
+    if (const auto* child = value->Find("stripeAverageEnabled")) equation.stripeAverageEnabled = child->AsBool(equation.stripeAverageEnabled);
+    if (const auto* child = value->Find("stripeDensity")) equation.stripeDensity = child->AsNumber(equation.stripeDensity);
+    if (const auto* child = value->Find("stripePhase")) equation.stripePhase = child->AsNumber(equation.stripePhase);
+    if (const auto* child = value->Find("stripeStrength")) equation.stripeStrength = child->AsNumber(equation.stripeStrength);
+    if (const auto* child = value->Find("stripeStartIteration")) equation.stripeStartIteration = child->AsInt(equation.stripeStartIteration);
     if (const auto* child = value->Find("animateCoefficients")) equation.animateCoefficients = child->AsBool(equation.animateCoefficients);
     if (const auto* child = value->Find("coefficientAnimationSpeed")) equation.coefficientAnimationSpeed = child->AsNumber(equation.coefficientAnimationSpeed);
     if (const auto* child = value->Find("coefficientAnimationAmplitude")) equation.coefficientAnimationAmplitude = child->AsNumber(equation.coefficientAnimationAmplitude);
@@ -162,6 +189,33 @@ Value PaletteColoursToJson(const std::vector<Colour>& colours) {
     values.reserve(colours.size());
     for (const auto& colour : colours) values.push_back(ColourToJson(colour));
     return values;
+}
+
+Value ExactCameraToJson(const ExactCamera& camera) {
+    return Value::Object{
+        {"centreX", camera.centreX.CanonicalText()},
+        {"centreY", camera.centreY.CanonicalText()},
+        {"halfHeight", camera.halfHeight.CanonicalText()},
+    };
+}
+
+bool ExactCameraFromJson(const Value* value, ExactCamera& camera, std::string& error) {
+    if (!value || !value->IsObject()) {
+        error = "Schema-3 preset exactCamera must be an object.";
+        return false;
+    }
+    const auto* centreX = value->Find("centreX");
+    const auto* centreY = value->Find("centreY");
+    const auto* halfHeight = value->Find("halfHeight");
+    if (!centreX || !centreY || !halfHeight || !centreX->IsString() ||
+        !centreY->IsString() || !halfHeight->IsString() ||
+        !ExactDecimal::Parse(centreX->AsString(), camera.centreX, error) ||
+        !ExactDecimal::Parse(centreY->AsString(), camera.centreY, error) ||
+        !ExactDecimal::Parse(halfHeight->AsString(), camera.halfHeight, error)) {
+        if (error.empty()) error = "Schema-3 preset exactCamera fields must be strings.";
+        return false;
+    }
+    return true;
 }
 
 bool PaletteColoursFromJson(const Value* value, std::vector<Colour>& colours, std::string& error) {
@@ -243,12 +297,21 @@ std::optional<EquationPreset> EquationPresetFromJson(const Value& root, std::str
 }
 
 Value PresetToJson(const Preset& preset) {
+    ExactCamera exact;
+    std::string exactError;
+    if (preset.exactCamera.has_value()) {
+        exact = *preset.exactCamera;
+    } else if (!BuildExactCameraFromLegacy(preset.camera, exact, exactError)) {
+        return Value::Object{};
+    }
     return Value::Object{
-        {"schemaVersion", 2},
+        {"schemaVersion", 3},
         {"id", preset.id},
         {"name", preset.name},
         {"builtIn", preset.builtIn},
         {"camera", Value::Object{{"centreX", preset.camera.centreX}, {"centreY", preset.camera.centreY}, {"scale", preset.camera.scale}, {"centreXLow", preset.camera.centreXLow}, {"centreYLow", preset.camera.centreYLow}}},
+        {"exactCamera", ExactCameraToJson(exact)},
+        {"rotationDegrees", preset.rotationDegrees},
         {"startingScale", preset.startingScale},
         {"maximumZoom", preset.maximumZoom},
         {"zoomSpeed", preset.zoomSpeed},
@@ -258,6 +321,9 @@ Value PresetToJson(const Preset& preset) {
         {"palette", ToString(preset.palette)},
         {"customPaletteColours", PaletteColoursToJson(preset.customPaletteColours)},
         {"colourOffset", preset.colourOffset},
+        {"paletteFrequency", preset.paletteFrequency},
+        {"paletteGamma", preset.paletteGamma},
+        {"paletteInterpolation", ToString(preset.paletteInterpolation)},
         {"colourCycleSpeed", preset.colourCycleSpeed},
         {"brightness", preset.brightness},
         {"contrast", preset.contrast},
@@ -279,6 +345,12 @@ std::optional<Preset> PresetFromJson(const Value& root, std::string& error) {
         return std::nullopt;
     }
     Preset preset;
+    const int schemaVersion = root.Find("schemaVersion")
+        ? root.Find("schemaVersion")->AsInt(2) : 2;
+    if (schemaVersion != 2 && schemaVersion != 3) {
+        error = "Preset schema version is unsupported.";
+        return std::nullopt;
+    }
     const auto* id = root.Find("id");
     const auto* name = root.Find("name");
     const auto* camera = root.Find("camera");
@@ -296,6 +368,17 @@ std::optional<Preset> PresetFromJson(const Value& root, std::string& error) {
     if (const auto* value = camera->Find("scale")) preset.camera.scale = value->AsNumber(preset.camera.scale);
     if (const auto* value = camera->Find("centreXLow")) preset.camera.centreXLow = value->AsNumber(preset.camera.centreXLow);
     if (const auto* value = camera->Find("centreYLow")) preset.camera.centreYLow = value->AsNumber(preset.camera.centreYLow);
+    if (schemaVersion == 3) {
+        ExactCamera exact;
+        LegacyCameraAdaptation adapted;
+        if (!ExactCameraFromJson(root.Find("exactCamera"), exact, error) ||
+            !AdaptExactCameraToLegacy(exact, adapted, error)) {
+            return std::nullopt;
+        }
+        preset.exactCamera = std::move(exact);
+        preset.camera = adapted.camera;
+    }
+    if (const auto* value = root.Find("rotationDegrees")) preset.rotationDegrees = value->AsNumber(preset.rotationDegrees);
     if (const auto* value = root.Find("startingScale")) preset.startingScale = value->AsNumber(preset.camera.scale);
     else preset.startingScale = preset.camera.scale;
     if (const auto* value = root.Find("maximumZoom")) preset.maximumZoom = value->AsNumber(preset.maximumZoom);
@@ -318,6 +401,13 @@ std::optional<Preset> PresetFromJson(const Value& root, std::string& error) {
     if (!PaletteColoursFromJson(root.Find("customPaletteColours"), preset.customPaletteColours, error)) return std::nullopt;
     if (const auto* value = root.Find("automaticJourneyWaypoints")) preset.automaticJourneyWaypoints = value->AsString();
     if (const auto* value = root.Find("colourOffset")) preset.colourOffset = value->AsNumber(preset.colourOffset);
+    if (const auto* value = root.Find("paletteFrequency")) preset.paletteFrequency = value->AsNumber(preset.paletteFrequency);
+    if (const auto* value = root.Find("paletteGamma")) preset.paletteGamma = value->AsNumber(preset.paletteGamma);
+    if (const auto* value = root.Find("paletteInterpolation")) {
+        const auto interpolation = PaletteInterpolationFromString(value->AsString());
+        if (!interpolation) { error = "Preset contains an unsupported palette interpolation mode."; return std::nullopt; }
+        preset.paletteInterpolation = *interpolation;
+    }
     if (const auto* value = root.Find("colourCycleSpeed")) preset.colourCycleSpeed = value->AsNumber(preset.colourCycleSpeed);
     if (const auto* value = root.Find("brightness")) preset.brightness = value->AsNumber(preset.brightness);
     if (const auto* value = root.Find("contrast")) preset.contrast = value->AsNumber(preset.contrast);
@@ -397,6 +487,27 @@ bool WriteAtomically(const std::filesystem::path& path, const std::string& text,
     return true;
 }
 
+bool ReadSourceSchemaVersion(const std::string& text, int& version, std::string& error) {
+    const auto parsed = json::Parse(text, 1024 * 1024);
+    if (!parsed.value || !parsed.value->IsObject()) {
+        error = "Settings source is not a valid JSON object.";
+        return false;
+    }
+    version = 9;
+    if (const auto* schema = parsed.value->Find("schemaVersion")) {
+        if (!schema->IsNumber()) {
+            error = "Settings schemaVersion must be a number.";
+            return false;
+        }
+        version = schema->AsInt(version);
+    }
+    if (version < 1 || version > 12) {
+        error = "Settings schemaVersion is unsupported.";
+        return false;
+    }
+    return true;
+}
+
 } // namespace
 
 SettingsStore::SettingsStore(std::filesystem::path settingsPath)
@@ -418,6 +529,50 @@ LoadSettingsResult SettingsStore::Load() const {
     std::string parseError;
     auto settings = DeserialiseSettings(text, parseError);
     if (settings) {
+        int sourceSchemaVersion = 12;
+        if (!ReadSourceSchemaVersion(text, sourceSchemaVersion, parseError)) {
+            result.usedDefaults = true;
+            result.warning = parseError;
+            return result;
+        }
+        if (sourceSchemaVersion < 12) {
+            const auto timestamp = std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+            const auto backup = settingsPath_.string() + ".pre-schema-" +
+                std::to_string(sourceSchemaVersion) + "-" + std::to_string(timestamp) + ".json";
+            std::error_code migrationError;
+            std::filesystem::copy_file(settingsPath_, backup,
+                                       std::filesystem::copy_options::none, migrationError);
+            if (migrationError) {
+                result.settings = std::move(*settings);
+                result.warning = "Legacy settings were loaded but not promoted because the original backup could not be preserved.";
+                return result;
+            }
+            std::string saveError;
+            if (!Save(*settings, saveError)) {
+                result.settings = std::move(*settings);
+                result.warning = "Legacy settings were loaded but schema-12 promotion failed after preserving the original. " + saveError;
+                return result;
+            }
+            std::string verifyReadError;
+            const auto promotedText = ReadFile(settingsPath_, verifyReadError);
+            std::string verifyParseError;
+            const auto verified = verifyReadError.empty()
+                ? DeserialiseSettings(promotedText, verifyParseError) : std::nullopt;
+            if (!verified || verified->schemaVersion != 12) {
+                std::filesystem::copy_file(backup, settingsPath_,
+                                           std::filesystem::copy_options::overwrite_existing,
+                                           migrationError);
+                result.settings = std::move(*settings);
+                result.warning = "Legacy settings were loaded but schema-12 promotion verification failed; the original was restored.";
+                return result;
+            }
+            result.settings = std::move(*verified);
+            result.migrated = true;
+            result.migrationBackupPath = backup;
+            result.warning = "Settings were migrated forward to schema 12; the original was preserved.";
+            return result;
+        }
         result.settings = std::move(*settings);
         return result;
     }
@@ -470,8 +625,6 @@ std::string SettingsStore::SerialiseSettings(const AppSettings& settings) {
     for (const auto& preset : settings.customPalettePresets) customPalettePresets.push_back(PalettePresetToJson(preset));
     Value::Array customEquationPresets;
     for (const auto& preset : settings.customEquationPresets) customEquationPresets.push_back(EquationPresetToJson(preset));
-    Value::Object assignments;
-    for (const auto& [monitor, preset] : settings.monitorPresetAssignments) assignments[monitor] = preset;
     Value::Array staticImages;
     for (const auto& path : settings.staticWallpaper.imagePaths) staticImages.push_back(path);
 
@@ -486,7 +639,7 @@ std::string SettingsStore::SerialiseSettings(const AppSettings& settings) {
             {"reducedMotion", settings.general.reducedMotion},
             {"colourCyclingEnabled", settings.general.colourCyclingEnabled},
             {"restoreOnExit", settings.general.restoreOnExit},
-            {"startWallpaperOnLaunch", settings.general.startWallpaperOnLaunch},
+            {"defaultDesktopMode", ToString(settings.general.defaultDesktopMode)},
         }},
         {"staticWallpaper", Value::Object{
             {"enabled", settings.staticWallpaper.enabled},
@@ -495,7 +648,12 @@ std::string SettingsStore::SerialiseSettings(const AppSettings& settings) {
             {"currentIndex", settings.staticWallpaper.currentIndex},
             {"order", ToString(settings.staticWallpaper.order)},
             {"storageDirectory", settings.staticWallpaper.storageDirectory},
+            {"savedImageFormat", ToString(settings.staticWallpaper.savedImageFormat)},
+            {"compressionQuality", settings.staticWallpaper.compressionQuality},
             {"imagePaths", std::move(staticImages)},
+        }},
+        {"videoWallpaper", Value::Object{
+            {"filePath", settings.videoWallpaper.filePath},
         }},
         {"performance", Value::Object{
             {"profile", ToString(settings.performance.profile)},
@@ -536,7 +694,6 @@ std::string SettingsStore::SerialiseSettings(const AppSettings& settings) {
                 {"minimumVisibleColourChange", settings.performance.adaptive.minimumVisibleColourChange},
             }},
         }},
-        {"monitorPresetAssignments", std::move(assignments)},
         {"customPresets", std::move(customPresets)},
         {"customPalettePresets", std::move(customPalettePresets)},
         {"customEquationPresets", std::move(customEquationPresets)},
@@ -573,7 +730,14 @@ std::optional<AppSettings> SettingsStore::DeserialiseSettings(const std::string&
         if (const auto* value = general->Find("reducedMotion")) settings.general.reducedMotion = value->AsBool(settings.general.reducedMotion);
         if (const auto* value = general->Find("colourCyclingEnabled")) settings.general.colourCyclingEnabled = value->AsBool(settings.general.colourCyclingEnabled);
         if (const auto* value = general->Find("restoreOnExit")) settings.general.restoreOnExit = value->AsBool(settings.general.restoreOnExit);
-        if (const auto* value = general->Find("startWallpaperOnLaunch")) settings.general.startWallpaperOnLaunch = value->AsBool(settings.general.startWallpaperOnLaunch);
+        if (const auto* value = general->Find("defaultDesktopMode")) {
+            const auto mode = DesktopModeFromString(value->AsString());
+            if (!mode) { error = "Settings contain an unsupported default desktop mode."; return std::nullopt; }
+            settings.general.defaultDesktopMode = *mode;
+        } else if (const auto* legacyStart = general->Find("startWallpaperOnLaunch"); legacyStart && legacyStart->AsBool(false)) {
+            // Continuously rendered wallpaper was removed in schema 11.
+            settings.general.defaultDesktopMode = DesktopMode::None;
+        }
     }
     if (const auto* staticWallpaper = root.Find("staticWallpaper"); staticWallpaper && staticWallpaper->IsObject()) {
         if (const auto* value = staticWallpaper->Find("enabled")) settings.staticWallpaper.enabled = value->AsBool(settings.staticWallpaper.enabled);
@@ -596,6 +760,14 @@ std::optional<AppSettings> SettingsStore::DeserialiseSettings(const std::string&
             }
             settings.staticWallpaper.storageDirectory = value->AsString();
         }
+        if (const auto* value = staticWallpaper->Find("savedImageFormat")) {
+            const auto format = SavedImageFormatFromString(value->AsString());
+            if (!format) { error = "Settings contain an unsupported saved-image format."; return std::nullopt; }
+            settings.staticWallpaper.savedImageFormat = *format;
+        }
+        if (const auto* value = staticWallpaper->Find("compressionQuality")) {
+            settings.staticWallpaper.compressionQuality = value->AsInt(settings.staticWallpaper.compressionQuality);
+        }
         if (const auto* images = staticWallpaper->Find("imagePaths")) {
             if (!images->IsArray() || images->AsArray().size() > 512) {
                 error = "Static wallpaper image history is invalid or too large.";
@@ -609,6 +781,16 @@ std::optional<AppSettings> SettingsStore::DeserialiseSettings(const std::string&
                 }
                 settings.staticWallpaper.imagePaths.push_back(image.AsString());
             }
+        }
+    }
+    if (const auto* videoWallpaper = root.Find("videoWallpaper"); videoWallpaper && videoWallpaper->IsObject()) {
+        if (const auto* value = videoWallpaper->Find("filePath")) {
+            if (!value->IsString() || value->AsString().size() > 32768 ||
+                value->AsString().find('\0') != std::string::npos) {
+                error = "The video wallpaper path is invalid.";
+                return std::nullopt;
+            }
+            settings.videoWallpaper.filePath = value->AsString();
         }
     }
     if (const auto* performance = root.Find("performance"); performance && performance->IsObject()) {
@@ -661,11 +843,6 @@ std::optional<AppSettings> SettingsStore::DeserialiseSettings(const std::string&
             if (const auto* value = adaptive->Find("minimumVisibleColourChange")) settings.performance.adaptive.minimumVisibleColourChange = value->AsNumber(settings.performance.adaptive.minimumVisibleColourChange);
         }
     }
-    if (const auto* assignments = root.Find("monitorPresetAssignments"); assignments && assignments->IsObject()) {
-        for (const auto& [monitor, value] : assignments->AsObject()) {
-            if (value.IsString() && monitor.size() <= 256 && value.AsString().size() <= 80) settings.monitorPresetAssignments[monitor] = value.AsString();
-        }
-    }
     if (const auto* customPresets = root.Find("customPresets"); customPresets && customPresets->IsArray()) {
         if (customPresets->AsArray().size() > 256) {
             error = "Settings contain too many custom presets.";
@@ -709,7 +886,7 @@ std::optional<AppSettings> SettingsStore::DeserialiseSettings(const std::string&
     }
     const int sourceSchemaVersion = settings.schemaVersion;
     const auto validation = ValidateAndNormalise(settings);
-    if (!validation.valid && sourceSchemaVersion != 1 && sourceSchemaVersion != 2 && sourceSchemaVersion != 3 && sourceSchemaVersion != 4 && sourceSchemaVersion != 5 && sourceSchemaVersion != 6 && sourceSchemaVersion != 7) {
+    if (!validation.valid && sourceSchemaVersion != 1 && sourceSchemaVersion != 2 && sourceSchemaVersion != 3 && sourceSchemaVersion != 4 && sourceSchemaVersion != 5 && sourceSchemaVersion != 6 && sourceSchemaVersion != 7 && sourceSchemaVersion != 8 && sourceSchemaVersion != 9 && sourceSchemaVersion != 10) {
         error = "Settings schema is unsupported.";
         return std::nullopt;
     }

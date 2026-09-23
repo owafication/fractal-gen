@@ -2,7 +2,10 @@
 
 #include "Core/AdaptivePerformance.h"
 #include "Core/Animation.h"
+#include "Core/GeneralAnimation.h"
 #include "Core/Models.h"
+#include "Core/ProjectState.h"
+#include "Core/ProjectHistory.h"
 #include "Core/SettingsStore.h"
 #include "Rendering/GpuRenderer.h"
 #include "App/QuickControllerWindow.h"
@@ -16,6 +19,7 @@
 
 #include <chrono>
 #include <filesystem>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -44,17 +48,22 @@ private:
         NavigationEquationButton,
         PresetLibraryButton,
         CoordinatesEdit,
+        RotationEdit,
         PreviewContextLabel,
         WallpaperContextLabel,
         PresetCombo,
         PaletteCombo,
         PaletteEditorButton,
         EquationEditorButton,
-        AnimationCombo,
+        DesktopModeCombo,
+        ApplyDesktopModeButton,
+        DefaultDesktopModeCheck,
+        JourneySettingsButton,
+        GeneralAnimationButton,
         PerformanceCombo,
         MonitorModeCombo,
-        MonitorCombo,
-        MonitorAssignmentCombo,
+        RetiredMonitorCombo,
+        RetiredMonitorAssignmentCombo,
         PresetNameEdit,
         CentreXEdit,
         CentreYEdit,
@@ -82,6 +91,8 @@ private:
         ManageSlideshowButton,
         PauseButton,
         StopButton,
+        UndoButton,
+        RedoButton,
         ResetViewButton,
         SaveNewButton,
         SaveChangesButton,
@@ -91,7 +102,7 @@ private:
         DeletePresetButton,
         ImportPresetButton,
         ExportPresetButton,
-        AssignMonitorButton,
+        RetiredAssignMonitorButton,
         StartupCheck,
         FullscreenCheck,
         BatteryCheck,
@@ -106,10 +117,25 @@ private:
         CopyDiagnosticsButton,
         ClearLogsButton,
         OpenControllerButton,
+        FractalScoutButton,
         RenderHighResButton,
+        ExportFramesButton,
+        ExportVideoButton,
     };
 
     static constexpr UINT TimerId = 1;
+    class AuxiliaryWindowSession {
+    public:
+        explicit AuxiliaryWindowSession(AppWindow& app);
+        ~AuxiliaryWindowSession();
+        AuxiliaryWindowSession(const AuxiliaryWindowSession&) = delete;
+        AuxiliaryWindowSession& operator=(const AuxiliaryWindowSession&) = delete;
+    private:
+        AppWindow& app_;
+        HWND controller_{nullptr};
+        bool controllerWasEnabled_{false};
+    };
+    static bool OpensAuxiliaryWindow(int command);
     static constexpr UINT TaskbarCreatedMessageFallback = WM_APP + 70;
 
     static LRESULT CALLBACK WindowProcedure(HWND window, UINT message, WPARAM wParam, LPARAM lParam);
@@ -126,20 +152,50 @@ private:
     void PopulateMonitorControls();
     void ShowSelectedTab();
     void SelectPage(int page);
-    void UpdateMonitorAssignmentControls();
-    void LoadMonitorAssignmentSelection();
     void SyncNumericEditsFromTracks();
     void SyncTrackFromNumericEdit(int controlId);
+    bool ApplyMainWindowPaletteSelection(bool refreshPreview = true);
+    bool ApplyMainWindowPalettePostControls(bool refreshPreview = true);
+    bool RecordProjectHistory(const Preset& before, const ParameterMutationResult& result,
+                              const std::string& label);
+    void UndoProjectEdit();
+    void RedoProjectEdit();
+    void RefreshAfterProjectHistory(const ProjectHistoryApplyResult& result);
+    void UpdateHistoryCommands();
+    enum class CameraMutationOrigin {
+        ControlEdit,
+        CoordinateTriplet,
+        Jump,
+        ScoutApply,
+        ResetView,
+        PreviewPan,
+        PreviewWheelZoom,
+    };
+    void SyncMainWindowCameraControls();
+    bool ApplyMainWindowCameraMutation(const CameraState& camera,
+                                       CameraMutationOrigin origin,
+                                       bool refreshPreview = true,
+                                       const ExactCamera* exactCamera = nullptr);
+    bool ApplyMainWindowRotationMutation(double rotationDegrees,
+                                         bool refreshPreview = true);
     void UpdateCoordinatesEdit();
-    bool ApplyCoordinatesEdit(bool showError);
-    void LoadSelectedPreset();
+    bool ApplyCoordinatesEdit(bool showError, bool refreshPreview = false);
+    bool PreviewCanRenderCamera(const CameraState& camera, bool showError);
+    void RestartPreviewRenderer();
+    void LoadSelectedPreset(ProjectPresetReplacementContext context = {
+        ParameterMutationOrigin::PresetLoad,
+        ProjectPresetReplacementKind::PresetLoad});
+    bool ApplyWorkingPresetReplacement(Preset candidate,
+                                       ProjectPresetReplacementContext context,
+                                       ProjectPresetReplacementResult* resultOut = nullptr);
     void ApplyControlsToWorkingPreset();
     void ApplyPerformanceProfile();
     bool SaveSettings(std::string* errorOut = nullptr);
     void UpdateStatus();
     void RenderTick();
     void PollSystemState();
-    void SetWallpaper();
+    void SelectVideoWallpaper();
+    void StartSavedVideoWallpaper();
     void StartSavedStaticWallpaper();
     void SetStaticWallpaper();
     void AddPreviewToSlideshow();
@@ -159,7 +215,6 @@ private:
     void DeleteSelectedPreset();
     void ImportPreset();
     void ExportPreset();
-    void AssignPresetToMonitor();
     void ToggleStartup();
     void OpenLogFolder();
     void CopyDiagnostics();
@@ -171,12 +226,20 @@ private:
     void ToggleZoomMotion();
     void TogglePreviewZoomMotion();
     void TogglePreviewColourCycling();
-    void ToggleDesktopZoomMotion();
-    void ToggleDesktopColourCycling();
     void ApplyPreviewAsSlideshowWallpaper();
+    void ApplySelectedDesktopMode();
+    void ApplyDesktopMode(DesktopMode mode);
+    void OpenJourneySettings();
+    void OpenGeneralAnimationEditor();
+    void UpdateDesktopModeControls();
     void JumpToCoordinates();
     void OpenQuickController();
+    void OpenFractalScout();
     void OpenHighResRenderDialog();
+    void OpenFrameSequenceExportDialog();
+    void OpenVideoExportDialog();
+    bool BeginExportPresentationPause(const char* reason);
+    void EndExportPresentationPause(bool resumePresentation);
     void UpdateQuickController();
 
     Preset* FindPresetMutable(const std::string& id);
@@ -204,15 +267,14 @@ private:
     HWND navigationEquationButton_{nullptr};
     HWND presetLibraryButton_{nullptr};
     HWND coordinatesEdit_{nullptr};
+    HWND rotationEdit_{nullptr};
     HWND previewContextLabel_{nullptr};
     HWND wallpaperContextLabel_{nullptr};
     HWND presetCombo_{nullptr};
     HWND paletteCombo_{nullptr};
-    HWND animationCombo_{nullptr};
+    HWND desktopModeCombo_{nullptr};
     HWND performanceCombo_{nullptr};
     HWND monitorModeCombo_{nullptr};
-    HWND monitorCombo_{nullptr};
-    HWND monitorAssignmentCombo_{nullptr};
     HWND presetNameEdit_{nullptr};
     HWND centreXEdit_{nullptr};
     HWND centreYEdit_{nullptr};
@@ -244,16 +306,21 @@ private:
 
     HICON icon_{nullptr};
     HFONT uiFont_{nullptr};
+    UINT mainDpi_{96};
     TrayIcon trayIcon_;
     QuickControllerWindow quickController_;
     UINT taskbarCreatedMessage_{0};
 
     bool draggingPreview_{false};
     POINT dragStart_{};
+    ParameterGestureCoalescer previewGestureCoalescer_;
+    ProjectHistory projectHistory_;
     bool exitRequested_{false};
     std::string previewRendererError_;
     bool userPaused_{false};
     bool autoPaused_{false};
+    bool exportDialogOpen_{false};
+    bool auxiliaryWindowOpen_{false};
     bool adaptivePaused_{false};
     bool previewChangesPending_{false};
     // Every process starts with a still preview and still desktop runtime.
@@ -261,8 +328,7 @@ private:
     // the Quick Controller without mutating the saved preset.
     bool zoomMotionEnabled_{false};
     bool previewColourCyclingEnabled_{false};
-    bool desktopZoomMotionEnabled_{false};
-    bool desktopColourCyclingEnabled_{false};
+    DesktopMode currentDesktopMode_{DesktopMode::None};
     int selectedTab_{0};
     std::chrono::steady_clock::time_point lastFrameTime_{};
     std::chrono::steady_clock::time_point lastSystemPoll_{};
@@ -273,9 +339,16 @@ private:
     AppSettings settings_;
     std::vector<Preset> builtInPresets_;
     Preset workingPreset_;
+    // Dialog edits preview through a temporary candidate and never persist until accepted.
+    std::optional<Preset> dialogPreviewPreset_;
+    std::optional<AppSettings> dialogPreviewSettings_;
     GpuRenderer previewRenderer_;
     AnimationController previewAnimation_;
     AnimationFrame lastPreviewFrame_;
+    AnimationTimeline generalAnimationTimeline_;
+    AnimationTimeline generalAnimationPreviewTimeline_;
+    AnimationClockBank generalAnimationClocks_;
+    bool generalAnimationPreviewActive_{false};
     WallpaperController wallpaperController_;
     SystemStateMonitor systemStateMonitor_;
     AdaptivePerformanceController adaptivePerformanceController_;

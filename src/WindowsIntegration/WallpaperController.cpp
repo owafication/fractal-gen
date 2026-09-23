@@ -1,13 +1,19 @@
 #include "WindowsIntegration/WallpaperController.h"
+#include "WindowsIntegration/ImageCodec.h"
 
-#include "Core/MandelbrotMath.h"
 #include "Infrastructure/Logger.h"
 
 #include <algorithm>
 #include <chrono>
 #include <cmath>
-#include <fstream>
-#include <limits>
+#include <cwctype>
+#include <new>
+
+#ifdef _WIN32
+#include <mferror.h>
+#include <mfplay.h>
+#include <propvarutil.h>
+#endif
 
 namespace mw {
 
@@ -18,63 +24,104 @@ WallpaperController::~WallpaperController() {
 }
 
 void WallpaperController::UpdateConfiguration(const AppSettings& settings, const std::vector<Preset>& presets) {
-    const bool preserveRuntimeColourState = running_ && !userStatic_;
-    const bool runtimeColourCyclingEnabled = settings_.general.colourCyclingEnabled;
     settings_ = settings;
-    if (preserveRuntimeColourState) {
-        settings_.general.colourCyclingEnabled = runtimeColourCyclingEnabled;
-    }
-    presets_ = presets;
+    (void)presets;
 #ifdef _WIN32
     if (userStatic_ && !settings_.staticWallpaper.imagePaths.empty()) {
         staticImageIndex_ = std::clamp(settings_.staticWallpaper.currentIndex, 0,
             static_cast<int>(settings_.staticWallpaper.imagePaths.size()) - 1);
     }
-    RebuildAnimations();
-    visibleChangeDetector_.Reset();
-    forceNextRender_ = true;
-#endif
-}
-
-void WallpaperController::SelectPreset(const std::string& presetId) {
-    settings_.selectedPresetId = presetId;
-#ifdef _WIN32
-    RebuildAnimations();
-    visibleChangeDetector_.Reset();
-    forceNextRender_ = true;
-#endif
-}
-
-void WallpaperController::SetColourCyclingEnabled(bool enabled) {
-    settings_.general.colourCyclingEnabled = enabled;
-    sharedAnimation_.SetColourCyclingEnabled(enabled);
-    for (auto& [monitor, animation] : monitorAnimations_) {
-        (void)monitor;
-        animation.SetColourCyclingEnabled(enabled);
-    }
-#ifdef _WIN32
-    visibleChangeDetector_.Reset();
-    forceNextRender_ = true;
-#endif
-}
-
-
-void WallpaperController::SetMotionEnabled(bool enabled) {
-    motionEnabled_ = enabled;
-    sharedAnimation_.SetMotionEnabled(enabled);
-    for (auto& [monitor, animation] : monitorAnimations_) {
-        (void)monitor;
-        animation.SetMotionEnabled(enabled);
-    }
-#ifdef _WIN32
-    visibleChangeDetector_.Reset();
-    forceNextRender_ = true;
 #endif
 }
 
 #ifdef _WIN32
 namespace {
 constexpr wchar_t kWallpaperClass[] = L"MandelbrotLiveWallpaperHost";
+constexpr UINT kVideoPlaybackFailedMessage = WM_APP + 41U;
+constexpr UINT kVideoPlaybackLoopedMessage = WM_APP + 42U;
+constexpr UINT kVideoPlaybackReadyMessage = WM_APP + 43U;
+
+class LoopingVideoCallback final : public IMFPMediaPlayerCallback {
+public:
+    explicit LoopingVideoCallback(HWND targetWindow) : targetWindow_(targetWindow) {}
+
+    STDMETHODIMP QueryInterface(REFIID interfaceId, void** object) override {
+        if (!object) return E_POINTER;
+        if (interfaceId == __uuidof(IUnknown) || interfaceId == __uuidof(IMFPMediaPlayerCallback)) {
+            *object = static_cast<IMFPMediaPlayerCallback*>(this);
+            AddRef();
+            return S_OK;
+        }
+        *object = nullptr;
+        return E_NOINTERFACE;
+    }
+
+    STDMETHODIMP_(ULONG) AddRef() override {
+        return static_cast<ULONG>(InterlockedIncrement(&references_));
+    }
+
+    STDMETHODIMP_(ULONG) Release() override {
+        const ULONG remaining = static_cast<ULONG>(InterlockedDecrement(&references_));
+        if (remaining == 0U) delete this;
+        return remaining;
+    }
+
+    void STDMETHODCALLTYPE OnMediaPlayerEvent(MFP_EVENT_HEADER* event) override {
+        if (!event) {
+            ReportFailure(E_POINTER);
+            return;
+        }
+        if (FAILED(event->hrEvent)) {
+            LogError("Video event failed: type " + std::to_string(event->eEventType) +
+                     ", HRESULT " + std::to_string(static_cast<unsigned long>(event->hrEvent)) + ".");
+            ReportFailure(event->hrEvent);
+            return;
+        }
+        if (!event->pMediaPlayer) {
+            ReportFailure(E_POINTER);
+            return;
+        }
+        HRESULT result = S_OK;
+        if (event->eEventType == MFP_EVENT_TYPE_MEDIAITEM_SET) {
+            result = event->pMediaPlayer->Play();
+        } else if (event->eEventType == MFP_EVENT_TYPE_PLAYBACK_ENDED) {
+            PROPVARIANT start{};
+            result = InitPropVariantFromInt64(0, &start);
+            if (SUCCEEDED(result)) {
+                result = event->pMediaPlayer->SetPosition(MFP_POSITIONTYPE_100NS, &start);
+                PropVariantClear(&start);
+            }
+            if (SUCCEEDED(result)) loopPending_ = true;
+        } else if (event->eEventType == MFP_EVENT_TYPE_POSITION_SET) {
+            result = event->pMediaPlayer->Play();
+        } else if (event->eEventType == MFP_EVENT_TYPE_PLAY && targetWindow_) {
+            PostMessageW(targetWindow_, kVideoPlaybackReadyMessage, 0, 0);
+            if (loopPending_ && !loopReported_) {
+                PostMessageW(targetWindow_, kVideoPlaybackLoopedMessage, 0, 0);
+                loopReported_ = true;
+            }
+            loopPending_ = false;
+        }
+        if (FAILED(result)) {
+            LogError("Video event action failed: type " + std::to_string(event->eEventType) + ".");
+            ReportFailure(result);
+        }
+    }
+
+private:
+    void ReportFailure(HRESULT result) const {
+        if (targetWindow_) {
+            PostMessageW(targetWindow_, kVideoPlaybackFailedMessage, 0,
+                         static_cast<LPARAM>(static_cast<LONG_PTR>(result)));
+        }
+    }
+
+    ~LoopingVideoCallback() = default;
+    LONG references_{1};
+    HWND targetWindow_{nullptr};
+    bool loopPending_{false};
+    bool loopReported_{false};
+};
 
 std::string WideToUtf8(const std::wstring& text) {
     if (text.empty()) return {};
@@ -126,7 +173,7 @@ bool WallpaperController::CreateWallpaperWindow(HINSTANCE instance, std::string&
                               WS_POPUP | WS_VISIBLE, virtualBounds_.left, virtualBounds_.top, width, height,
                               nullptr, nullptr, instance, this);
     if (!window_) {
-        error = "The wallpaper rendering window could not be created.";
+        error = "The desktop presentation window could not be created.";
         return false;
     }
     if (!desktopHost_.Attach(window_, error)) {
@@ -141,49 +188,20 @@ bool WallpaperController::CreateWallpaperWindow(HINSTANCE instance, std::string&
     return true;
 }
 
-bool WallpaperController::Start(HINSTANCE instance, const AppSettings& settings, const std::vector<Preset>& presets, std::string& error) {
-    Stop();
-    instance_ = instance;
-    settings_ = settings;
-    presets_ = presets;
-    userStatic_ = false;
-    pausedSnapshot_ = false;
-    staticFallback_ = false;
-    if (!RegisterWindowClass(instance_, error) || !CreateWallpaperWindow(instance_, error)) return false;
-    RebuildAnimations();
-    rendererRestartAttempted_ = false;
-    lastRendererError_.clear();
-    visibleChangeDetector_.Reset();
-    forceNextRender_ = true;
-    if (!InitialiseRendererWithRetry(error)) {
-        lastRendererError_ = error;
-        BuildStaticFallback();
-        staticFallback_ = true;
-        InvalidateRect(window_, nullptr, FALSE);
-        LogWarning("GPU renderer unavailable; static Mandelbrot fallback enabled.");
-    }
-    running_ = true;
-    paused_ = false;
-    pauseReason_.clear();
-    lastAttachmentCheck_ = std::chrono::steady_clock::now();
-    LogInfo("Wallpaper started across " + std::to_string(displays_.size()) + " display(s) in " + ToString(settings_.monitorMode) + " mode.");
-    return true;
-}
-
 bool WallpaperController::StartStaticGallery(HINSTANCE instance, const AppSettings& settings,
                                              const std::vector<Preset>& presets, std::string& error) {
     Stop();
+    lastRuntimeError_.clear();
     instance_ = instance;
     settings_ = settings;
-    presets_ = presets;
+    (void)presets;
     if (settings_.staticWallpaper.imagePaths.empty()) {
         error = "No saved static renders are available.";
         return false;
     }
     if (!RegisterWindowClass(instance_, error) || !CreateWallpaperWindow(instance_, error)) return false;
-    staticFallback_ = false;
-    pausedSnapshot_ = false;
     userStatic_ = true;
+    userVideo_ = false;
     if (!LoadStaticImageByIndex(settings_.staticWallpaper.currentIndex, error)) {
         desktopHost_.Detach(window_);
         DestroyWindow(window_);
@@ -201,6 +219,74 @@ bool WallpaperController::StartStaticGallery(HINSTANCE instance, const AppSettin
     return true;
 }
 
+bool WallpaperController::StartVideo(HINSTANCE instance, const AppSettings& settings,
+                                     const std::vector<Preset>& presets,
+                                     const std::filesystem::path& path, std::string& error) {
+    Stop();
+    lastRuntimeError_.clear();
+    std::error_code fileError;
+    if (path.empty() || !std::filesystem::is_regular_file(path, fileError) || fileError) {
+        error = "The selected video file does not exist or is not a regular file.";
+        return false;
+    }
+    std::wstring extension = path.extension().wstring();
+    std::transform(extension.begin(), extension.end(), extension.begin(),
+                   [](wchar_t value) { return static_cast<wchar_t>(std::towlower(value)); });
+    if (extension != L".mp4") {
+        error = "Video wallpaper currently accepts exported MP4 files only.";
+        return false;
+    }
+
+    instance_ = instance;
+    settings_ = settings;
+    (void)presets;
+    userStatic_ = false;
+    userVideo_ = true;
+    videoReady_ = false;
+    videoPaintDeferred_ = false;
+    videoLoopCount_ = 0;
+    if (!RegisterWindowClass(instance_, error) || !CreateWallpaperWindow(instance_, error)) {
+        userVideo_ = false;
+        return false;
+    }
+
+    videoCallback_ = new (std::nothrow) LoopingVideoCallback(window_);
+    if (!videoCallback_) {
+        error = "The video playback callback could not be allocated.";
+        Stop();
+        return false;
+    }
+    HRESULT result = MFPCreateMediaPlayer(nullptr, FALSE, 0, videoCallback_, window_, &videoPlayer_);
+    IMFPMediaItem* mediaItem = nullptr;
+    if (SUCCEEDED(result)) {
+        result = videoPlayer_->CreateMediaItemFromURL(path.c_str(), TRUE, 0, &mediaItem);
+    }
+    BOOL hasVideo = FALSE;
+    BOOL selected = FALSE;
+    if (SUCCEEDED(result)) result = mediaItem->HasVideo(&hasVideo, &selected);
+    if (SUCCEEDED(result) && (!hasVideo || !selected)) result = MF_E_INVALIDMEDIATYPE;
+    if (SUCCEEDED(result)) result = videoPlayer_->SetMute(TRUE);
+    BOOL muted = FALSE;
+    if (SUCCEEDED(result)) result = videoPlayer_->GetMute(&muted);
+    if (SUCCEEDED(result) && !muted) result = E_FAIL;
+    if (SUCCEEDED(result)) result = videoPlayer_->SetMediaItem(mediaItem);
+    if (mediaItem) mediaItem->Release();
+    if (FAILED(result)) {
+        error = "Windows Media Foundation could not open the selected MP4 video (HRESULT " +
+            std::to_string(static_cast<unsigned long>(result)) + ").";
+        Stop();
+        return false;
+    }
+
+    running_ = true;
+    paused_ = false;
+    pauseReason_.clear();
+    lastAttachmentCheck_ = std::chrono::steady_clock::now();
+    LogInfo("Video wallpaper mute state verified by Windows Media Foundation.");
+    LogInfo("Video wallpaper started from an exported MP4 file.");
+    return true;
+}
+
 bool WallpaperController::RenderStaticSnapshot(const Preset& snapshot, std::string& error) {
     const int virtualWidth = std::max(1L, virtualBounds_.right - virtualBounds_.left);
     const int virtualHeight = std::max(1L, virtualBounds_.bottom - virtualBounds_.top);
@@ -209,11 +295,15 @@ bool WallpaperController::RenderStaticSnapshot(const Preset& snapshot, std::stri
         RenderRegion region;
         region.pixels = {0, 0, virtualWidth, virtualHeight};
         region.camera = snapshot.camera;
+        region.rotationDegrees = snapshot.rotationDegrees;
         region.palette = snapshot.palette;
         region.customPaletteColours = snapshot.customPaletteColours;
         region.equation = snapshot.equation;
         region.maximumIterations = snapshot.maximumIterations;
         region.colourOffset = snapshot.colourOffset;
+        region.paletteFrequency = snapshot.paletteFrequency;
+        region.paletteGamma = snapshot.paletteGamma;
+        region.paletteInterpolation = snapshot.paletteInterpolation;
         region.brightness = snapshot.brightness;
         region.contrast = snapshot.contrast;
         region.saturation = snapshot.saturation;
@@ -231,11 +321,15 @@ bool WallpaperController::RenderStaticSnapshot(const Preset& snapshot, std::stri
                 display.bounds.bottom - virtualBounds_.top,
             };
             region.camera = snapshot.camera;
+            region.rotationDegrees = snapshot.rotationDegrees;
             region.palette = snapshot.palette;
             region.customPaletteColours = snapshot.customPaletteColours;
             region.equation = snapshot.equation;
             region.maximumIterations = snapshot.maximumIterations;
             region.colourOffset = snapshot.colourOffset;
+            region.paletteFrequency = snapshot.paletteFrequency;
+            region.paletteGamma = snapshot.paletteGamma;
+            region.paletteInterpolation = snapshot.paletteInterpolation;
             region.brightness = snapshot.brightness;
             region.contrast = snapshot.contrast;
             region.saturation = snapshot.saturation;
@@ -255,48 +349,14 @@ bool WallpaperController::RenderStaticSnapshot(const Preset& snapshot, std::stri
 bool WallpaperController::SaveStaticImage(const std::filesystem::path& path,
                                           const std::vector<std::uint32_t>& pixels,
                                           int width, int height, std::string& error) const {
-    if (width <= 0 || height <= 0 ||
-        pixels.size() != static_cast<std::size_t>(width) * static_cast<std::size_t>(height)) {
+    if (width <= 0 || height <= 0) {
         error = "The captured static image dimensions are invalid.";
         return false;
     }
-    std::error_code directoryError;
-    std::filesystem::create_directories(path.parent_path(), directoryError);
-    if (directoryError) {
-        error = "The static render directory could not be created.";
-        return false;
-    }
-    BITMAPFILEHEADER fileHeader{};
-    BITMAPINFOHEADER infoHeader{};
-    infoHeader.biSize = sizeof(infoHeader);
-    infoHeader.biWidth = width;
-    infoHeader.biHeight = height;
-    infoHeader.biPlanes = 1;
-    infoHeader.biBitCount = 32;
-    infoHeader.biCompression = BI_RGB;
-    const std::uint64_t imageBytes = static_cast<std::uint64_t>(pixels.size()) * sizeof(std::uint32_t);
-    if (imageBytes > std::numeric_limits<DWORD>::max()) {
-        error = "The captured static image is too large for BMP storage.";
-        return false;
-    }
-    infoHeader.biSizeImage = static_cast<DWORD>(imageBytes);
-    fileHeader.bfType = 0x4D42;
-    fileHeader.bfOffBits = static_cast<DWORD>(sizeof(fileHeader) + sizeof(infoHeader));
-    fileHeader.bfSize = fileHeader.bfOffBits + infoHeader.biSizeImage;
-
-    std::ofstream stream(path, std::ios::binary | std::ios::trunc);
-    if (!stream) {
-        error = "The static render image could not be created.";
-        return false;
-    }
-    stream.write(reinterpret_cast<const char*>(&fileHeader), static_cast<std::streamsize>(sizeof(fileHeader)));
-    stream.write(reinterpret_cast<const char*>(&infoHeader), static_cast<std::streamsize>(sizeof(infoHeader)));
-    stream.write(reinterpret_cast<const char*>(pixels.data()), static_cast<std::streamsize>(imageBytes));
-    if (!stream) {
-        error = "The complete static render image could not be written.";
-        return false;
-    }
-    return true;
+    return SavePixelsWithWic(path, settings_.staticWallpaper.savedImageFormat,
+                             settings_.staticWallpaper.compressionQuality,
+                             pixels, static_cast<std::uint32_t>(width),
+                             static_cast<std::uint32_t>(height), 96.0, error);
 }
 
 bool WallpaperController::LoadStaticImage(const std::string& pathUtf8, std::string& error) {
@@ -305,39 +365,13 @@ bool WallpaperController::LoadStaticImage(const std::string& pathUtf8, std::stri
         error = "A saved static render path is not valid UTF-8.";
         return false;
     }
-    std::ifstream stream(std::filesystem::path(widePath), std::ios::binary);
-    if (!stream) {
-        error = "A saved static render image could not be opened.";
-        return false;
-    }
-    BITMAPFILEHEADER fileHeader{};
-    BITMAPINFOHEADER infoHeader{};
-    stream.read(reinterpret_cast<char*>(&fileHeader), static_cast<std::streamsize>(sizeof(fileHeader)));
-    stream.read(reinterpret_cast<char*>(&infoHeader), static_cast<std::streamsize>(sizeof(infoHeader)));
-    if (!stream || fileHeader.bfType != 0x4D42 || infoHeader.biSize < sizeof(BITMAPINFOHEADER) ||
-        infoHeader.biPlanes != 1 || infoHeader.biBitCount != 32 || infoHeader.biCompression != BI_RGB ||
-        infoHeader.biWidth <= 0 || infoHeader.biHeight <= 0) {
-        error = "A saved static render is not a supported 32-bit BMP image.";
-        return false;
-    }
-    const std::uint64_t pixelCount = static_cast<std::uint64_t>(infoHeader.biWidth) *
-                                     static_cast<std::uint64_t>(infoHeader.biHeight);
-    if (pixelCount == 0 || pixelCount > 100000000ULL ||
-        pixelCount > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max() / sizeof(std::uint32_t))) {
-        error = "A saved static render has unsafe dimensions.";
-        return false;
-    }
-    stream.seekg(static_cast<std::streamoff>(fileHeader.bfOffBits), std::ios::beg);
-    std::vector<std::uint32_t> pixels(static_cast<std::size_t>(pixelCount));
-    stream.read(reinterpret_cast<char*>(pixels.data()),
-                static_cast<std::streamsize>(pixels.size() * sizeof(std::uint32_t)));
-    if (!stream) {
-        error = "A saved static render image is incomplete.";
-        return false;
-    }
-    fallbackPixels_ = std::move(pixels);
-    fallbackWidth_ = infoHeader.biWidth;
-    fallbackHeight_ = infoHeader.biHeight;
+    std::vector<std::uint32_t> pixels;
+    int width = 0;
+    int height = 0;
+    if (!LoadPixelsWithWic(std::filesystem::path(widePath), pixels, width, height, error)) return false;
+    staticPixels_ = std::move(pixels);
+    staticWidth_ = width;
+    staticHeight_ = height;
     return true;
 }
 
@@ -367,9 +401,10 @@ bool WallpaperController::CaptureAndUseStatic(HINSTANCE instance, const AppSetti
                                               const std::filesystem::path& storageDirectory,
                                               std::string& savedPathUtf8, std::string& error) {
     Stop();
+    lastRuntimeError_.clear();
     instance_ = instance;
     settings_ = settings;
-    presets_ = presets;
+    (void)presets;
     if (!RegisterWindowClass(instance_, error) || !CreateWallpaperWindow(instance_, error)) return false;
     if (!InitialiseRendererWithRetry(error)) {
         desktopHost_.Detach(window_);
@@ -390,17 +425,17 @@ bool WallpaperController::CaptureAndUseStatic(HINSTANCE instance, const AppSetti
     }
     const auto timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
-    const auto path = storageDirectory / (L"static-render-" + std::to_wstring(timestamp) + L".bmp");
+    std::wstring fileName = L"static-render-" + std::to_wstring(timestamp) + L".";
+    fileName += SavedImageExtension(settings_.staticWallpaper.savedImageFormat);
+    const auto path = storageDirectory / fileName;
     if (!SaveStaticImage(path, pixels, width, height, error)) {
         Stop();
         return false;
     }
     renderer_.Shutdown();
-    fallbackPixels_ = std::move(pixels);
-    fallbackWidth_ = width;
-    fallbackHeight_ = height;
-    staticFallback_ = false;
-    pausedSnapshot_ = false;
+    staticPixels_ = std::move(pixels);
+    staticWidth_ = width;
+    staticHeight_ = height;
     userStatic_ = true;
     staticImageIndex_ = static_cast<int>(settings_.staticWallpaper.imagePaths.size());
     running_ = true;
@@ -438,228 +473,117 @@ bool WallpaperController::InitialiseRendererWithRetry(std::string& error) {
 }
 
 void WallpaperController::Stop() {
+    videoReady_ = false;
+    if (videoPlayer_) {
+        videoPlayer_->Shutdown();
+        videoPlayer_->Release();
+        videoPlayer_ = nullptr;
+    }
+    if (videoCallback_) {
+        videoCallback_->Release();
+        videoCallback_ = nullptr;
+    }
     if (!window_) {
-        fallbackPixels_.clear();
-        staticFallback_ = false;
+        staticPixels_.clear();
         userStatic_ = false;
-        pausedSnapshot_ = false;
+        userVideo_ = false;
+        videoLoopCount_ = 0;
         staticImageIndex_ = 0;
         running_ = false;
         paused_ = false;
         pauseReason_.clear();
-        visibleChangeDetector_.Reset();
-        forceNextRender_ = true;
         return;
     }
     renderer_.Shutdown();
     desktopHost_.Detach(window_);
     DestroyWindow(window_);
     window_ = nullptr;
-    fallbackPixels_.clear();
-    staticFallback_ = false;
+    staticPixels_.clear();
     userStatic_ = false;
-    pausedSnapshot_ = false;
+    userVideo_ = false;
+    videoLoopCount_ = 0;
     staticImageIndex_ = 0;
     running_ = false;
     paused_ = false;
     pauseReason_.clear();
-    visibleChangeDetector_.Reset();
-    forceNextRender_ = true;
     LogInfo("Wallpaper stopped and desktop host detached.");
 }
 
 void WallpaperController::Pause(std::string reason) {
     if (!running_) return;
+    if (userVideo_ && videoPlayer_ && videoReady_) {
+        const HRESULT result = videoPlayer_->Pause();
+        if (FAILED(result)) {
+            LogError("Video pause request failed: " + reason + ".");
+            PostMessageW(window_, kVideoPlaybackFailedMessage, 0,
+                         static_cast<LPARAM>(static_cast<LONG_PTR>(result)));
+            return;
+        }
+    }
     paused_ = true;
     pauseReason_ = std::move(reason);
 }
 
-bool WallpaperController::PauseAndReleaseGpu(std::string reason, std::string& error) {
+bool WallpaperController::PausePresentation(std::string reason, std::string& error) {
     if (!running_) {
         error = "The wallpaper is not running.";
         return false;
     }
     if (paused_) return true;
-    if (userStatic_ || staticFallback_ || !renderer_.IsReady()) {
-        Pause(std::move(reason));
-        return true;
-    }
-
-    std::vector<std::uint32_t> pixels;
-    int width = 0;
-    int height = 0;
-    if (!renderer_.CapturePixels(pixels, width, height, error)) {
-        // Still honour the pause request even if the zero-GPU snapshot could not be captured.
-        Pause(std::move(reason));
-        return false;
-    }
-    renderer_.Shutdown();
-    fallbackPixels_ = std::move(pixels);
-    fallbackWidth_ = width;
-    fallbackHeight_ = height;
-    pausedSnapshot_ = true;
-    paused_ = true;
-    pauseReason_ = std::move(reason);
-    InvalidateRect(window_, nullptr, FALSE);
-    LogInfo("Wallpaper paused on a captured frame and GPU resources were released.");
+    // File-backed image and video modes do not retain fractal GPU resources.
+    Pause(std::move(reason));
+    error.clear();
     return true;
+}
+
+std::optional<std::string> WallpaperController::TakeRuntimeError() {
+    if (lastRuntimeError_.empty()) return std::nullopt;
+    std::string error = std::move(lastRuntimeError_);
+    lastRuntimeError_.clear();
+    return error;
+}
+
+void WallpaperController::HandleVideoPlaybackFailure(HRESULT result) {
+    if (!running_ || !userVideo_) return;
+    lastRuntimeError_ = "Video playback stopped after Windows Media Foundation reported a failure (HRESULT " +
+        std::to_string(static_cast<unsigned long>(result)) + ").";
+    LogError(lastRuntimeError_);
+    Stop();
+}
+
+void WallpaperController::HandleVideoPlaybackLooped() {
+    if (!running_ || !userVideo_) return;
+    ++videoLoopCount_;
+    if (videoLoopCount_ == 1U) {
+        LogInfo("Video wallpaper reached end of file and restarted from position zero.");
+    }
+}
+
+void WallpaperController::HandleVideoPlaybackReady() {
+    if (!running_ || !userVideo_) return;
+    const bool firstReady = !videoReady_;
+    videoReady_ = true;
+    if (firstReady) LogInfo("Video playback is ready for presentation.");
+    if (paused_) Pause(pauseReason_);
+    InvalidateRect(window_, nullptr, FALSE);
 }
 
 void WallpaperController::Resume() {
     if (!running_) return;
-    if (pausedSnapshot_) {
-        std::string error;
-        if (!InitialiseRendererWithRetry(error)) {
-            lastRendererError_ = error;
-            pauseReason_ = "Resume failed; captured paused frame retained";
-            paused_ = true;
-            LogError("Wallpaper resume after paused snapshot failed: " + error);
-            return;
-        }
-        pausedSnapshot_ = false;
-        rendererRestartAttempted_ = false;
-        fallbackPixels_.clear();
-        fallbackWidth_ = 0;
-        fallbackHeight_ = 0;
-    }
     paused_ = false;
     pauseReason_.clear();
-    forceNextRender_ = true;
-}
-
-const Preset* WallpaperController::FindPreset(const std::string& id) const {
-    const auto found = std::find_if(presets_.begin(), presets_.end(), [&](const Preset& preset) { return preset.id == id; });
-    return found == presets_.end() ? nullptr : &*found;
-}
-
-void WallpaperController::RebuildAnimations() {
-    const Preset* selected = FindPreset(settings_.selectedPresetId);
-    if (!selected && !presets_.empty()) selected = &presets_.front();
-    if (selected) sharedAnimation_.SetPreset(*selected, settings_.general.reducedMotion);
-    sharedAnimation_.SetColourCyclingEnabled(settings_.general.colourCyclingEnabled);
-    sharedAnimation_.SetMotionEnabled(motionEnabled_);
-
-    monitorAnimations_.clear();
-    for (const auto& display : displays_) {
-        const std::string monitorKey = WideToUtf8(display.deviceName);
-        const auto assignment = settings_.monitorPresetAssignments.find(monitorKey);
-        const Preset* preset = assignment == settings_.monitorPresetAssignments.end() ? selected : FindPreset(assignment->second);
-        if (!preset) preset = selected;
-        AnimationController controller;
-        if (preset) controller.SetPreset(*preset, settings_.general.reducedMotion);
-        controller.SetColourCyclingEnabled(settings_.general.colourCyclingEnabled);
-        controller.SetMotionEnabled(motionEnabled_);
-        monitorAnimations_.emplace(display.deviceName, std::move(controller));
-    }
-}
-
-bool WallpaperController::RenderFrame(double deltaSeconds, std::string& error) {
-    if (staticFallback_) {
-        InvalidateRect(window_, nullptr, FALSE);
-        return true;
-    }
-    std::vector<RenderRegion> regions;
-    std::vector<const Preset*> regionPresets;
-    const Preset* selected = FindPreset(settings_.selectedPresetId);
-    if (!selected && !presets_.empty()) selected = &presets_.front();
-    if (!selected) {
-        error = "No valid preset is available.";
-        return false;
-    }
-
-    const int virtualWidth = std::max(1L, virtualBounds_.right - virtualBounds_.left);
-    const int virtualHeight = std::max(1L, virtualBounds_.bottom - virtualBounds_.top);
-    const int effectiveIterations = batteryQualityReduction_
-        ? std::max(64, static_cast<int>(std::lround(settings_.performance.maximumIterations * 0.6)))
-        : settings_.performance.maximumIterations;
-    if (settings_.monitorMode == MonitorMode::Span) {
-        const auto frame = sharedAnimation_.Update(deltaSeconds);
-        RenderRegion region;
-        region.pixels = {0, 0, virtualWidth, virtualHeight};
-        region.camera = frame.camera;
-        region.palette = selected->palette;
-        region.customPaletteColours = selected->customPaletteColours;
-        region.equation = selected->equation;
-        region.maximumIterations = effectiveIterations;
-        region.colourOffset = frame.colourOffset;
-        region.brightness = selected->brightness;
-        region.contrast = selected->contrast;
-        region.saturation = selected->saturation;
-        region.interiorColour = selected->interiorColour;
-        region.backgroundColour = selected->backgroundColour;
-        region.smoothColouring = selected->smoothColouring;
-        regions.push_back(region);
-        regionPresets.push_back(selected);
-    } else {
-        const auto sharedFrame = sharedAnimation_.Update(deltaSeconds);
-        for (const auto& display : displays_) {
-            const std::string monitorKey = WideToUtf8(display.deviceName);
-            const auto assignment = settings_.monitorPresetAssignments.find(monitorKey);
-            const Preset* preset = selected;
-            AnimationFrame frame = sharedFrame;
-            if (settings_.monitorMode == MonitorMode::Independent) {
-                if (assignment != settings_.monitorPresetAssignments.end()) {
-                    if (const Preset* assigned = FindPreset(assignment->second)) preset = assigned;
-                }
-                auto animation = monitorAnimations_.find(display.deviceName);
-                if (animation != monitorAnimations_.end()) frame = animation->second.Update(deltaSeconds);
-            }
-            RenderRegion region;
-            region.pixels = {
-                display.bounds.left - virtualBounds_.left,
-                display.bounds.top - virtualBounds_.top,
-                display.bounds.right - virtualBounds_.left,
-                display.bounds.bottom - virtualBounds_.top,
-            };
-            region.camera = frame.camera;
-            region.palette = preset->palette;
-            region.customPaletteColours = preset->customPaletteColours;
-            region.equation = preset->equation;
-            region.maximumIterations = effectiveIterations;
-            region.colourOffset = frame.colourOffset;
-            region.brightness = preset->brightness;
-            region.contrast = preset->contrast;
-            region.saturation = preset->saturation;
-            region.interiorColour = preset->interiorColour;
-            region.backgroundColour = preset->backgroundColour;
-            region.smoothColouring = preset->smoothColouring;
-            regions.push_back(region);
-            regionPresets.push_back(preset);
+    if (userVideo_ && videoPlayer_ && videoReady_) {
+        const HRESULT result = videoPlayer_->Play();
+        if (FAILED(result)) {
+            PostMessageW(window_, kVideoPlaybackFailedMessage, 0,
+                         static_cast<LPARAM>(static_cast<LONG_PTR>(result)));
         }
     }
-
-    RenderOptions options;
-    options.renderScale = batteryQualityReduction_ ? settings_.performance.renderScale * 0.66 : settings_.performance.renderScale;
-    options.antiAliasingLevel = batteryQualityReduction_ ? 1 : settings_.performance.antiAliasingLevel;
-    options.precision = settings_.performance.precision;
-
-    std::vector<VisualFrameDescriptor> descriptors;
-    descriptors.reserve(regions.size());
-    for (std::size_t index = 0; index < regions.size(); ++index) {
-        const auto& region = regions[index];
-        const Preset* preset = index < regionPresets.size() ? regionPresets[index] : selected;
-        VisualFrameDescriptor descriptor;
-        descriptor.camera = region.camera;
-        descriptor.colourOffset = region.colourOffset;
-        descriptor.pixelWidth = static_cast<int>(std::max<LONG>(1L, region.pixels.right - region.pixels.left));
-        descriptor.pixelHeight = static_cast<int>(std::max<LONG>(1L, region.pixels.bottom - region.pixels.top));
-        descriptor.contentRevision = ComputeVisualRevision(*preset, region.maximumIterations,
-                                                           options.renderScale, options.antiAliasingLevel,
-                                                           options.precision);
-        descriptors.push_back(descriptor);
-    }
-    const bool animatedEquation = std::any_of(regionPresets.begin(), regionPresets.end(),
-        [](const Preset* preset) { return preset && preset->equation.animateCoefficients; });
-    if (!visibleChangeDetector_.ShouldRender(descriptors, settings_.performance.adaptive,
-                                             forceNextRender_ || animatedEquation)) {
-        forceNextRender_ = false;
-        return true;
-    }
-    forceNextRender_ = false;
-    return renderer_.Render(regions, options, error);
 }
 
+
 void WallpaperController::Tick(double deltaSeconds) {
+    (void)deltaSeconds;
     if (!running_) return;
     const auto now = std::chrono::steady_clock::now();
     if (std::chrono::duration<double>(now - lastAttachmentCheck_).count() >= 2.0) {
@@ -667,6 +591,7 @@ void WallpaperController::Tick(double deltaSeconds) {
         lastAttachmentCheck_ = now;
     }
     if (paused_) return;
+    if (userVideo_) return;
     if (userStatic_) {
         if (settings_.staticWallpaper.cycleEnabled && settings_.staticWallpaper.imagePaths.size() > 1) {
             const double elapsed = std::chrono::duration<double>(now - lastStaticChange_).count();
@@ -681,8 +606,13 @@ void WallpaperController::Tick(double deltaSeconds) {
                 std::string cycleError;
                 if (LoadStaticImageByIndex(nextIndex, cycleError)) {
                     InvalidateRect(window_, nullptr, FALSE);
+                    LogInfo("Slideshow advanced to the next saved image.");
                 } else {
-                    LogWarning("Static render cycle failed: " + cycleError);
+                    lastRuntimeError_ = "The slideshow stopped because none of its configured image files could be loaded. " +
+                        cycleError;
+                    LogError(lastRuntimeError_);
+                    Stop();
+                    return;
                 }
                 lastStaticChange_ = now;
             }
@@ -690,27 +620,6 @@ void WallpaperController::Tick(double deltaSeconds) {
         return;
     }
 
-    std::string error;
-    if (RenderFrame(deltaSeconds, error)) return;
-    LogError("Wallpaper render failed: " + error);
-    if (!rendererRestartAttempted_) {
-        rendererRestartAttempted_ = true;
-        renderer_.Shutdown();
-        std::string retryError;
-        forceNextRender_ = true;
-        if (renderer_.Initialise(window_, retryError) && RenderFrame(0.0, retryError)) {
-            lastRendererError_.clear();
-            LogInfo("Renderer recovered after device/context loss.");
-            return;
-        }
-        lastRendererError_ = retryError;
-        LogError("Renderer recovery failed: " + retryError);
-    }
-    renderer_.Shutdown();
-    BuildStaticFallback();
-    staticFallback_ = true;
-    pauseReason_ = "GPU renderer stopped; static fallback active";
-    InvalidateRect(window_, nullptr, FALSE);
 }
 
 void WallpaperController::ReattachIfNeeded() {
@@ -735,99 +644,27 @@ void WallpaperController::HandleDisplayChange() {
     SetWindowPos(window_, HWND_BOTTOM, hostBounds.left, hostBounds.top,
                  hostBounds.right - hostBounds.left, hostBounds.bottom - hostBounds.top,
                  SWP_NOACTIVATE | SWP_SHOWWINDOW);
-    if (!pausedSnapshot_) {
-        renderer_.Resize(virtualBounds_.right - virtualBounds_.left, virtualBounds_.bottom - virtualBounds_.top);
-    }
-    RebuildAnimations();
-    visibleChangeDetector_.Reset();
-    forceNextRender_ = true;
-    if (staticFallback_) BuildStaticFallback();
-    if (userStatic_ || pausedSnapshot_) InvalidateRect(window_, nullptr, FALSE);
+    // Repaint through WM_PAINT, after playback readiness and BeginPaint.
+    if (userStatic_ || userVideo_) InvalidateRect(window_, nullptr, FALSE);
     LogInfo("Display configuration changed; wallpaper layout rebuilt.");
 }
 
-void WallpaperController::BuildStaticFallback() {
-    const int desktopWidth = std::max(1L, virtualBounds_.right - virtualBounds_.left);
-    const int desktopHeight = std::max(1L, virtualBounds_.bottom - virtualBounds_.top);
-    const double desktopAspect = static_cast<double>(desktopWidth) / desktopHeight;
 
-    // Keep the CPU fallback bounded while preserving the virtual desktop aspect ratio.
-    // This is substantially sharper than the old fixed 480x270 image, especially on multi-monitor desktops.
-    if (desktopAspect >= 1.0) {
-        fallbackWidth_ = std::min(desktopWidth, 1280);
-        fallbackHeight_ = std::max(1, static_cast<int>(std::lround(fallbackWidth_ / desktopAspect)));
-    } else {
-        fallbackHeight_ = std::min(desktopHeight, 720);
-        fallbackWidth_ = std::max(1, static_cast<int>(std::lround(fallbackHeight_ * desktopAspect)));
-    }
-    fallbackPixels_.assign(static_cast<std::size_t>(fallbackWidth_ * fallbackHeight_), 0xFF000000U);
-    const Preset* preset = FindPreset(settings_.selectedPresetId);
-    if (!preset && !presets_.empty()) preset = &presets_.front();
-    const CameraState camera = preset ? preset->camera : CameraState{};
-    const int iterations = std::clamp(settings_.performance.maximumIterations, 64, 400);
-    const double aspect = static_cast<double>(fallbackWidth_) / fallbackHeight_;
-    for (int y = 0; y < fallbackHeight_; ++y) {
-        for (int x = 0; x < fallbackWidth_; ++x) {
-            const double real = camera.centreX + ((static_cast<double>(x) / (fallbackWidth_ - 1)) * 2.0 - 1.0) * camera.scale * aspect;
-            const double imaginary = camera.centreY + ((static_cast<double>(y) / (fallbackHeight_ - 1)) * 2.0 - 1.0) * camera.scale;
-            const EquationSettings equation = preset ? preset->equation : EquationSettings{};
-            const auto escape = CalculateEscape(real, imaginary, iterations, equation);
-            std::uint8_t red = 0;
-            std::uint8_t green = 0;
-            std::uint8_t blue = 0;
-            if (escape.escaped || escape.converged) {
-                double t = escape.smoothValue / std::max(1, iterations) * 8.0;
-                if (equation.newtonMode || equation.renderMode == FractalRenderMode::Newton) {
-                    t = escape.rootIndex >= 0
-                        ? static_cast<double>(escape.rootIndex) / std::max(2, equation.newtonDegree)
-                        : 0.0;
-                    t += 0.08 * (1.0 - static_cast<double>(escape.iterations) / std::max(1, iterations));
-                } else if (equation.colouringMethod == ColouringMethod::OrbitTrap) {
-                    t = -std::log(std::max(escape.orbitTrapDistance, 1.0e-8)) * 0.32;
-                } else if (equation.colouringMethod == ColouringMethod::DistanceEstimation &&
-                           escape.distanceEstimate > 0.0) {
-                    t = -std::log(std::max(escape.distanceEstimate, 1.0e-10)) * 0.22;
-                }
-                t = std::fmod(t + (preset ? preset->colourOffset : 0.0), 1.0);
-                if (t < 0.0) t += 1.0;
-                const double hue = t * 6.0;
-                const int sector = static_cast<int>(std::floor(hue)) % 6;
-                const double fraction = hue - std::floor(hue);
-                const double q = 1.0 - fraction;
-                const double values[6][3] = {
-                    {1.0, fraction, 0.0}, {q, 1.0, 0.0}, {0.0, 1.0, fraction},
-                    {0.0, q, 1.0}, {fraction, 0.0, 1.0}, {1.0, 0.0, q},
-                };
-                double glow = 0.0;
-                if (equation.glowStrength > 0.0) {
-                    glow = std::exp(-std::min(escape.orbitTrapDistance, 10.0) * 12.0) *
-                           equation.glowStrength * 0.2;
-                }
-                red = static_cast<std::uint8_t>(std::clamp((values[sector][0] + glow) * 255.0, 0.0, 255.0));
-                green = static_cast<std::uint8_t>(std::clamp((values[sector][1] + glow) * 255.0, 0.0, 255.0));
-                blue = static_cast<std::uint8_t>(std::clamp((values[sector][2] + glow) * 255.0, 0.0, 255.0));
-            }
-            fallbackPixels_[static_cast<std::size_t>((fallbackHeight_ - 1 - y) * fallbackWidth_ + x)] =
-                0xFF000000U | (static_cast<std::uint32_t>(red) << 16U) | (static_cast<std::uint32_t>(green) << 8U) | blue;
-        }
-    }
-}
-
-void WallpaperController::PaintStaticFallback(HDC dc) {
-    if (fallbackPixels_.empty()) return;
+void WallpaperController::PaintStaticImage(HDC dc) {
+    if (staticPixels_.empty()) return;
     RECT client{};
     GetClientRect(window_, &client);
     BITMAPINFO info{};
     info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    info.bmiHeader.biWidth = fallbackWidth_;
-    info.bmiHeader.biHeight = fallbackHeight_;
+    info.bmiHeader.biWidth = staticWidth_;
+    info.bmiHeader.biHeight = staticHeight_;
     info.bmiHeader.biPlanes = 1;
     info.bmiHeader.biBitCount = 32;
     info.bmiHeader.biCompression = BI_RGB;
     const int previousMode = SetStretchBltMode(dc, HALFTONE);
     SetBrushOrgEx(dc, 0, 0, nullptr);
-    StretchDIBits(dc, 0, 0, client.right, client.bottom, 0, 0, fallbackWidth_, fallbackHeight_,
-                  fallbackPixels_.data(), &info, DIB_RGB_COLORS, SRCCOPY);
+    StretchDIBits(dc, 0, 0, client.right, client.bottom, 0, 0, staticWidth_, staticHeight_,
+                  staticPixels_.data(), &info, DIB_RGB_COLORS, SRCCOPY);
     SetStretchBltMode(dc, previousMode);
 }
 
@@ -839,10 +676,37 @@ LRESULT CALLBACK WallpaperController::WindowProcedure(HWND window, UINT message,
         SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(self));
     }
     if (self) {
-        if (message == WM_PAINT && (self->staticFallback_ || self->userStatic_ || self->pausedSnapshot_)) {
+        if (message == kVideoPlaybackFailedMessage) {
+            self->HandleVideoPlaybackFailure(static_cast<HRESULT>(static_cast<LONG_PTR>(lParam)));
+            return 0;
+        }
+        if (message == kVideoPlaybackLoopedMessage) {
+            self->HandleVideoPlaybackLooped();
+            return 0;
+        }
+        if (message == kVideoPlaybackReadyMessage) {
+            self->HandleVideoPlaybackReady();
+            return 0;
+        }
+        if (message == WM_PAINT && (self->userStatic_ || self->userVideo_)) {
             PAINTSTRUCT paint{};
             HDC dc = BeginPaint(window, &paint);
-            self->PaintStaticFallback(dc);
+            if (self->userVideo_ && self->videoPlayer_ && self->videoReady_) {
+                const HRESULT result = self->videoPlayer_->UpdateVideo();
+                if (FAILED(result)) {
+                    LogError("Video repaint failed after playback readiness.");
+                    PostMessageW(window, kVideoPlaybackFailedMessage, 0,
+                                 static_cast<LPARAM>(static_cast<LONG_PTR>(result)));
+                }
+            } else if (self->userVideo_) {
+                if (!self->videoPaintDeferred_) {
+                    LogInfo("Video repaint deferred until playback is ready.");
+                    self->videoPaintDeferred_ = true;
+                }
+                FillRect(dc, &paint.rcPaint, static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));
+            } else {
+                self->PaintStaticImage(dc);
+            }
             EndPaint(window, &paint);
             return 0;
         }

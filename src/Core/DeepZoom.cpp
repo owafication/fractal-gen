@@ -11,6 +11,12 @@
 #include <vector>
 
 namespace mw {
+
+const OrbitEncodingDescriptor& CurrentOrbitEncoding() noexcept {
+    static constexpr OrbitEncodingDescriptor descriptor{
+        "mw-orbit-float4-expansion/v1", 1, 4, 32, false, 0};
+    return descriptor;
+}
 namespace {
 
 struct ComplexDouble {
@@ -27,6 +33,18 @@ ComplexDouble Multiply(const ComplexDouble& first, const ComplexDouble& second) 
         first.real * second.real - first.imaginary * second.imaginary,
         first.real * second.imaginary + first.imaginary * second.real,
     };
+}
+
+ComplexDouble Scale(const ComplexDouble& value, double factor) {
+    return {value.real * factor, value.imaginary * factor};
+}
+
+ComplexDouble Conjugate(const ComplexDouble& value) {
+    return {value.real, -value.imaginary};
+}
+
+double Magnitude(const ComplexDouble& value) {
+    return std::hypot(value.real, value.imaginary);
 }
 
 ComplexDouble Coefficient(const ComplexCoefficient& coefficient) {
@@ -261,6 +279,11 @@ FixedComplex Multiply(const FixedComplex& first, const FixedComplex& second) {
     };
 }
 
+FixedComplex Conjugate(const FixedComplex& value) {
+    const FixedReal zero = value.imaginary - value.imaginary;
+    return {value.real, zero - value.imaginary};
+}
+
 FixedComplex AbsComponents(const FixedComplex& value, const EquationSettings& equation) {
     return {
         equation.absoluteReal ? value.real.Abs() : value.real,
@@ -282,6 +305,7 @@ ReferenceOrbit BuildDoubleOrbit(const CameraState& camera, const EquationSetting
     const ComplexDouble linear = Coefficient(equation.linear);
     const ComplexDouble parameter = Coefficient(equation.parameter);
     const ComplexDouble constant = Coefficient(equation.constant);
+    const double bailoutSquared = equation.bailoutRadius * equation.bailoutRadius;
     ComplexDouble z{};
     for (int iteration = 0; iteration < maximumIterations; ++iteration) {
         ReferenceOrbitPoint point;
@@ -291,13 +315,14 @@ ReferenceOrbit BuildDoubleOrbit(const CameraState& camera, const EquationSetting
         point.imaginary[1] = static_cast<float>(z.imaginary - static_cast<double>(point.imaginary[0]));
         orbit.points.push_back(point);
         const double magnitudeSquared = z.real * z.real + z.imaginary * z.imaginary;
-        if (!std::isfinite(magnitudeSquared) || magnitudeSquared > 4.0) {
+        if (!std::isfinite(magnitudeSquared) || magnitudeSquared > bailoutSquared) {
             orbit.escaped = true;
             orbit.escapeIteration = iteration;
             break;
         }
         if (equation.absoluteReal) z.real = std::abs(z.real);
         if (equation.absoluteImaginary) z.imaginary = std::abs(z.imaginary);
+        if (equation.conjugate) z = Conjugate(z);
         z = Add(Add(Add(Multiply(quadratic, Multiply(z, z)), Multiply(linear, z)),
                     Multiply(parameter, c)), constant);
     }
@@ -371,6 +396,7 @@ ReferenceOrbit BuildReferenceOrbitArbitrary(const CameraState& camera,
     const FixedComplex linear = FromCoefficient(equation.linear, precisionBits);
     const FixedComplex parameter = FromCoefficient(equation.parameter, precisionBits);
     const FixedComplex constant = FromCoefficient(equation.constant, precisionBits);
+    const double bailoutSquared = equation.bailoutRadius * equation.bailoutRadius;
     FixedComplex z(precisionBits);
 
     for (int iteration = 0; iteration < maximumIterations; ++iteration) {
@@ -381,12 +407,13 @@ ReferenceOrbit BuildReferenceOrbitArbitrary(const CameraState& camera,
         point.imaginary = z.imaginary.ToFloatExpansion();
         orbit.points.push_back(point);
         const double magnitudeSquared = real * real + imaginary * imaginary;
-        if (!std::isfinite(magnitudeSquared) || magnitudeSquared > 4.0) {
+        if (!std::isfinite(magnitudeSquared) || magnitudeSquared > bailoutSquared) {
             orbit.escaped = true;
             orbit.escapeIteration = iteration;
             break;
         }
-        const FixedComplex working = AbsComponents(z, equation);
+        FixedComplex working = AbsComponents(z, equation);
+        if (equation.conjugate) working = Conjugate(working);
         z = Add(Add(Add(Multiply(quadratic, Multiply(working, working)), Multiply(linear, working)),
                     Multiply(parameter, c)), constant);
     }
@@ -395,17 +422,167 @@ ReferenceOrbit BuildReferenceOrbitArbitrary(const CameraState& camera,
     return orbit;
 }
 
-bool EquationSupportsPerturbation(const EquationSettings& equation) noexcept {
-    const auto nearZero = [](const ComplexCoefficient& value) {
-        return std::abs(value.real) < 1.0e-12 && std::abs(value.imaginary) < 1.0e-12;
+PerturbationProfile ResolvePerturbationProfile(
+    const EquationSettings& equation) noexcept {
+    const auto near = [](const ComplexCoefficient& value, double real, double imaginary) {
+        return std::abs(value.real - real) < 1.0e-12 &&
+               std::abs(value.imaginary - imaginary) < 1.0e-12;
     };
-    return equation.renderMode == FractalRenderMode::EscapeTime && equation.power == 2 &&
-           equation.parameterPower == 1 &&
-           equation.reciprocalPower == 0 && !equation.absoluteReal && !equation.absoluteImaginary &&
-           !equation.conjugate && !equation.swapRealImaginary &&
-           equation.unaryTransform == EquationUnaryTransform::None && !equation.juliaMode &&
-           equation.initialZMode == InitialZMode::Zero && nearZero(equation.iterationTerm) &&
-           nearZero(equation.reciprocalCoefficient) && !equation.animateCoefficients;
+    const auto nearZero = [&](const ComplexCoefficient& value) {
+        return near(value, 0.0, 0.0);
+    };
+    const bool common =
+        equation.renderMode == FractalRenderMode::EscapeTime &&
+        !equation.newtonMode && equation.power == 2 &&
+        equation.parameterPower == 1 && equation.reciprocalPower == 0 &&
+        !equation.absoluteReal && !equation.absoluteImaginary &&
+        !equation.swapRealImaginary &&
+        equation.unaryTransform == EquationUnaryTransform::None &&
+        !equation.juliaMode && equation.initialZMode == InitialZMode::Zero &&
+        nearZero(equation.iterationTerm) &&
+        nearZero(equation.reciprocalCoefficient) &&
+        !equation.animateCoefficients;
+    if (!common) return PerturbationProfile::Unsupported;
+    if (!equation.conjugate) return PerturbationProfile::AnalyticQuadratic;
+    if (near(equation.quadratic, 1.0, 0.0) &&
+        near(equation.linear, 0.0, 0.0) &&
+        near(equation.parameter, 1.0, 0.0) &&
+        near(equation.constant, 0.0, 0.0)) {
+        return PerturbationProfile::TricornQuadratic;
+    }
+    return PerturbationProfile::Unsupported;
+}
+
+PerturbationFormulaCapability DescribePerturbationProfile(
+    PerturbationProfile profile) noexcept {
+    switch (profile) {
+    case PerturbationProfile::AnalyticQuadratic:
+        return {profile, "analytic-quadratic-mandelbrot", 1, true};
+    case PerturbationProfile::TricornQuadratic:
+        return {profile, "tricorn-power2", 1, true};
+    case PerturbationProfile::Unsupported:
+        return {profile, "unsupported", 0, false};
+    }
+    return {PerturbationProfile::Unsupported, "unsupported", 0, false};
+}
+
+bool EquationSupportsPerturbation(const EquationSettings& equation) noexcept {
+    return ResolvePerturbationProfile(equation) != PerturbationProfile::Unsupported;
+}
+
+namespace {
+
+ComplexDouble ExpansionValue(const ReferenceOrbitPoint& point) {
+    ComplexDouble value;
+    for (float component : point.real) value.real += static_cast<double>(component);
+    for (float component : point.imaginary) value.imaginary += static_cast<double>(component);
+    return value;
+}
+
+PerturbationSampleResult ResultFromReferenceOrbit(const ReferenceOrbit& orbit,
+                                                   int maximumIterations,
+                                                   double bailoutSquared) {
+    PerturbationSampleResult result;
+    result.referenceRefreshed = true;
+    result.stable = true;
+    result.validity = PerturbationSampleValidity::Rebased;
+    result.escaped = orbit.escaped;
+    result.iterations = orbit.escaped ? orbit.escapeIteration : maximumIterations;
+    const int index = std::clamp(result.iterations, 0,
+                                 static_cast<int>(orbit.points.size()) - 1);
+    const ComplexDouble finalValue = ExpansionValue(orbit.points[static_cast<std::size_t>(index)]);
+    result.finalReal = finalValue.real;
+    result.finalImaginary = finalValue.imaginary;
+    const double magnitudeSquared = finalValue.real * finalValue.real +
+                                    finalValue.imaginary * finalValue.imaginary;
+    if (!result.escaped && magnitudeSquared > bailoutSquared) result.escaped = true;
+    return result;
+}
+
+} // namespace
+
+PerturbationSampleResult EvaluatePerturbationSample(
+    const CameraState& referenceCamera,
+    const EquationSettings& equation,
+    int maximumIterations,
+    double normalisedOffsetX,
+    double normalisedOffsetY,
+    int arbitraryPrecisionBits,
+    bool allowReferenceRefresh) {
+    maximumIterations = std::clamp(maximumIterations, 32, 4096);
+    const PerturbationProfile profile = ResolvePerturbationProfile(equation);
+    if (profile == PerturbationProfile::Unsupported) {
+        throw std::invalid_argument("The selected equation does not support perturbation.");
+    }
+    const bool arbitrary = arbitraryPrecisionBits > 0;
+    const ReferenceOrbit orbit = arbitrary
+        ? BuildReferenceOrbitArbitrary(referenceCamera, equation, maximumIterations,
+                                       arbitraryPrecisionBits)
+        : BuildReferenceOrbitDouble(referenceCamera, equation, maximumIterations);
+    const ComplexDouble quadratic = Coefficient(equation.quadratic);
+    const ComplexDouble linear = Coefficient(equation.linear);
+    const ComplexDouble parameter = Coefficient(equation.parameter);
+    const ComplexDouble local{normalisedOffsetX, normalisedOffsetY};
+    const double scale = referenceCamera.scale;
+    const double bailoutSquared = equation.bailoutRadius * equation.bailoutRadius;
+    ComplexDouble q{};
+    PerturbationSampleResult result;
+
+    for (int iteration = 0; iteration < maximumIterations; ++iteration) {
+        const ComplexDouble reference = ExpansionValue(
+            orbit.points[static_cast<std::size_t>(iteration)]);
+        const ComplexDouble delta = Scale(q, scale);
+        const ComplexDouble approximate = Add(reference, delta);
+        result.finalReal = approximate.real;
+        result.finalImaginary = approximate.imaginary;
+        const double relativeDelta = Magnitude(delta) /
+            std::max(1.0, Magnitude(reference));
+        result.maximumRelativeDelta = std::max(result.maximumRelativeDelta, relativeDelta);
+        if (!std::isfinite(relativeDelta) || relativeDelta > 0.5 ||
+            !std::isfinite(q.real) || !std::isfinite(q.imaginary)) {
+            result.stable = false;
+            break;
+        }
+        const double magnitudeSquared = approximate.real * approximate.real +
+                                        approximate.imaginary * approximate.imaginary;
+        if (!std::isfinite(magnitudeSquared) || magnitudeSquared > bailoutSquared) {
+            result.iterations = iteration;
+            result.escaped = true;
+            return result;
+        }
+
+        ComplexDouble workingReference = reference;
+        ComplexDouble workingQ = q;
+        if (profile == PerturbationProfile::TricornQuadratic) {
+            workingReference = Conjugate(workingReference);
+            workingQ = Conjugate(workingQ);
+        }
+        const ComplexDouble quadraticDelta = Add(
+            Scale(Multiply(workingReference, workingQ), 2.0),
+            Scale(Multiply(workingQ, workingQ), scale));
+        q = Add(Add(Multiply(quadratic, quadraticDelta),
+                    Multiply(linear, workingQ)),
+                Multiply(parameter, local));
+        result.iterations = iteration + 1;
+    }
+
+    if (result.stable) return result;
+    if (!allowReferenceRefresh) {
+        result.validity = PerturbationSampleValidity::Unresolved;
+        return result;
+    }
+
+    CameraState refreshedCamera = referenceCamera;
+    OffsetCamera(refreshedCamera, scale * normalisedOffsetX,
+                  scale * normalisedOffsetY);
+    const ReferenceOrbit refreshed = arbitrary
+        ? BuildReferenceOrbitArbitrary(refreshedCamera, equation, maximumIterations,
+                                       arbitraryPrecisionBits)
+        : BuildReferenceOrbitDouble(refreshedCamera, equation, maximumIterations);
+    PerturbationSampleResult refreshedResult =
+        ResultFromReferenceOrbit(refreshed, maximumIterations, bailoutSquared);
+    refreshedResult.maximumRelativeDelta = result.maximumRelativeDelta;
+    return refreshedResult;
 }
 
 std::string PrecisionModeDisplayName(PrecisionMode mode) {

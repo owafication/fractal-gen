@@ -109,11 +109,12 @@ int Selection(const DialogState& state) {
     return static_cast<int>(SendMessageW(GetDlgItem(state.window, ImageList), LB_GETCURSEL, 0, 0));
 }
 
-bool IsBmpPath(const std::filesystem::path& path) {
+bool IsSupportedImagePath(const std::filesystem::path& path) {
     std::wstring extension = path.extension().wstring();
     std::transform(extension.begin(), extension.end(), extension.begin(),
                    [](wchar_t ch) { return static_cast<wchar_t>(std::towlower(ch)); });
-    return extension == L".bmp";
+    return extension == L".png" || extension == L".jpg" || extension == L".jpeg" ||
+           extension == L".tif" || extension == L".tiff" || extension == L".bmp";
 }
 
 void UpdateSummary(DialogState& state) {
@@ -162,7 +163,7 @@ void RefreshList(DialogState& state, int requestedSelection = -1) {
 }
 
 bool AddPath(DialogState& state, const std::filesystem::path& path) {
-    if (state.working.imagePaths.size() >= kMaximumImages || !IsBmpPath(path)) return false;
+    if (state.working.imagePaths.size() >= kMaximumImages || !IsSupportedImagePath(path)) return false;
     const std::string utf8 = ToUtf8(path.wstring());
     if (utf8.empty()) return false;
     if (std::find(state.working.imagePaths.begin(), state.working.imagePaths.end(), utf8) !=
@@ -171,12 +172,12 @@ bool AddPath(DialogState& state, const std::filesystem::path& path) {
     return true;
 }
 
-std::vector<std::filesystem::path> SelectBmpFiles(HWND owner) {
+std::vector<std::filesystem::path> SelectImageFiles(HWND owner) {
     std::vector<wchar_t> buffer(32768, L'\0');
     OPENFILENAMEW dialog{};
     dialog.lStructSize = sizeof(dialog);
     dialog.hwndOwner = owner;
-    dialog.lpstrFilter = L"Mandelbrot static images (*.bmp)\0*.bmp\0All files (*.*)\0*.*\0";
+    dialog.lpstrFilter = L"Supported images (*.png;*.jpg;*.jpeg;*.tif;*.tiff;*.bmp)\0*.png;*.jpg;*.jpeg;*.tif;*.tiff;*.bmp\0All files (*.*)\0*.*\0";
     dialog.lpstrFile = buffer.data();
     dialog.nMaxFile = static_cast<DWORD>(buffer.size());
     dialog.Flags = OFN_EXPLORER | OFN_ALLOWMULTISELECT | OFN_FILEMUSTEXIST |
@@ -217,14 +218,14 @@ std::filesystem::path StorageFolder(const DialogState& state) {
 }
 
 void AddFiles(DialogState& state) {
-    const auto selected = SelectBmpFiles(state.window);
+    const auto selected = SelectImageFiles(state.window);
     int added = 0;
     for (const auto& path : selected) {
         if (AddPath(state, path)) ++added;
     }
     RefreshList(state, static_cast<int>(state.working.imagePaths.size()) - 1);
     if (!selected.empty() && added == 0) {
-        MessageBoxW(state.window, L"No new BMP files were added. The files may already be listed or the 512-image safety limit may have been reached.",
+        MessageBoxW(state.window, L"No new supported image files were added. The files may already be listed or the 512-image safety limit may have been reached.",
                     L"Static Slideshow", MB_OK | MB_ICONINFORMATION);
     }
 }
@@ -239,7 +240,7 @@ void ScanFolder(DialogState& state) {
     }
     std::vector<std::filesystem::path> files;
     for (std::filesystem::directory_iterator it(folder, error), end; !error && it != end; it.increment(error)) {
-        if (it->is_regular_file(error) && IsBmpPath(it->path())) files.push_back(it->path());
+        if (it->is_regular_file(error) && IsSupportedImagePath(it->path())) files.push_back(it->path());
     }
     if (error) {
         MessageBoxW(state.window, L"The selected folder could not be scanned.", L"Static Slideshow",
@@ -252,7 +253,7 @@ void ScanFolder(DialogState& state) {
         if (AddPath(state, path)) ++added;
     }
     RefreshList(state, static_cast<int>(state.working.imagePaths.size()) - 1);
-    const std::wstring message = L"Added " + std::to_wstring(added) + L" new BMP image(s) from the folder.";
+    const std::wstring message = L"Added " + std::to_wstring(added) + L" new supported image(s) from the folder.";
     MessageBoxW(state.window, message.c_str(), L"Static Slideshow", MB_OK | MB_ICONINFORMATION);
 }
 
@@ -383,7 +384,7 @@ LRESULT CALLBACK Procedure(HWND window, UINT message, WPARAM wParam, LPARAM lPar
         SendMessageW(list, LB_SETITEMHEIGHT, 0, ScaleDialogMetric(23, state->dpi));
         Add(window, state->instance, WC_BUTTONW, L"Add Images...", BS_PUSHBUTTON | WS_TABSTOP,
             AddImagesButton, 600, 92, 184, 30, state->font);
-        Add(window, state->instance, WC_BUTTONW, L"Add BMPs from Folder", BS_PUSHBUTTON | WS_TABSTOP,
+        Add(window, state->instance, WC_BUTTONW, L"Add Images from Folder", BS_PUSHBUTTON | WS_TABSTOP,
             ScanFolderButton, 600, 130, 184, 30, state->font);
         Add(window, state->instance, WC_BUTTONW, L"Remove", BS_PUSHBUTTON | WS_TABSTOP,
             RemoveButton, 600, 184, 184, 30, state->font);
@@ -396,7 +397,7 @@ LRESULT CALLBACK Procedure(HWND window, UINT message, WPARAM wParam, LPARAM lPar
         Add(window, state->instance, WC_BUTTONW, L"Clear List", BS_PUSHBUTTON | WS_TABSTOP,
             ClearButton, 600, 314, 184, 30, state->font);
         Add(window, state->instance, WC_STATICW,
-            L"Only local 32-bit BMP files are loaded. Missing or invalid entries are skipped safely at playback time.",
+            L"Local PNG, JPEG, TIFF and BMP files are loaded. Missing or invalid entries are skipped safely at playback time.",
             SS_LEFT, 0, 600, 370, 184, 76, state->font);
 
         Add(window, state->instance, WC_BUTTONW, L"Enable timed slideshow", BS_AUTOCHECKBOX | WS_TABSTOP,

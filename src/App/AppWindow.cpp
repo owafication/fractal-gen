@@ -4,12 +4,19 @@
 #include "App/DialogSupport.h"
 #include "App/PaletteEditorDialog.h"
 #include "App/EquationEditorDialog.h"
+#include "App/FractalScoutDialog.h"
+#include "App/FrameSequenceExportDialog.h"
+#include "App/VideoExportDialog.h"
 #include "App/SettingsDialog.h"
 #include "App/SlideshowDialog.h"
 #include "App/PrecisionDialog.h"
 #include "App/PresetManagerDialog.h"
 #include "App/HighResRenderDialog.h"
+#include "App/GeneralAnimationEditorDialog.h"
+#include "App/JourneySettingsDialog.h"
 #include "Core/DeepZoom.h"
+#include "Core/Precision/ExactCameraAdapter.h"
+#include "Core/Precision/PrecisionPlanner.h"
 #include "Infrastructure/Logger.h"
 #include "Infrastructure/Paths.h"
 #include "WindowsIntegration/DisplayManager.h"
@@ -31,7 +38,9 @@
 #include <fstream>
 #include <iomanip>
 #include <sstream>
+#include <stdexcept>
 #include <string_view>
+#include <utility>
 
 namespace mw {
 
@@ -39,6 +48,12 @@ namespace mw {
 namespace {
 constexpr wchar_t kAppClass[] = L"MandelbrotLiveWallpaperControl";
 constexpr wchar_t kPreviewClass[] = L"MandelbrotLiveWallpaperPreview";
+constexpr std::uint64_t kPreviewNavigationCoalescingWindowMilliseconds = 500U;
+
+std::uint64_t MonotonicMilliseconds() noexcept {
+    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+}
 
 HWND MakeControl(DWORD exStyle, const wchar_t* className, const wchar_t* text, DWORD style,
                  int id, HWND parent, HINSTANCE instance) {
@@ -70,6 +85,19 @@ std::wstring OpenFileDialog(HWND owner, bool save) {
     dialog.lpstrDefExt = L"json";
     const BOOL selected = save ? GetSaveFileNameW(&dialog) : GetOpenFileNameW(&dialog);
     return selected ? std::wstring(fileName) : std::wstring{};
+}
+
+std::wstring OpenVideoWallpaperDialog(HWND owner) {
+    wchar_t fileName[MAX_PATH]{};
+    OPENFILENAMEW dialog{};
+    dialog.lStructSize = sizeof(dialog);
+    dialog.hwndOwner = owner;
+    dialog.lpstrFilter = L"MP4 video (*.mp4)\0*.mp4\0\0";
+    dialog.lpstrFile = fileName;
+    dialog.nMaxFile = MAX_PATH;
+    dialog.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR;
+    dialog.lpstrDefExt = L"mp4";
+    return GetOpenFileNameW(&dialog) ? std::wstring(fileName) : std::wstring{};
 }
 
 std::string Slugify(const std::string& name) {
@@ -237,6 +265,36 @@ bool ParseCoordinateTriplet(std::wstring text, double& x, double& y, double& sca
     return true;
 }
 
+bool ParseExactCoordinateTriplet(std::wstring text, ExactCamera& camera, std::string& error) {
+    for (wchar_t& ch : text) {
+        if (ch == L';' || ch == L'|') ch = L',';
+    }
+    std::wstringstream stream(text);
+    std::wstring part;
+    std::array<ExactDecimal*, 3> values{{&camera.centreX, &camera.centreY, &camera.halfHeight}};
+    std::size_t count = 0U;
+    while (std::getline(stream, part, L',')) {
+        const auto first = part.find_first_not_of(L" \t\r\n");
+        if (first == std::wstring::npos) continue;
+        const auto last = part.find_last_not_of(L" \t\r\n");
+        const std::wstring trimmed = part.substr(first, last - first + 1U);
+        if (trimmed.find_first_of(L"\x80-\xffff") != std::wstring::npos || count >= values.size()) {
+            error = "Coordinates must contain exactly three ASCII decimal values.";
+            return false;
+        }
+        std::string ascii;
+        ascii.reserve(trimmed.size());
+        for (const wchar_t ch : trimmed) ascii.push_back(static_cast<char>(ch));
+        if (!ExactDecimal::Parse(ascii, *values[count], error)) return false;
+        ++count;
+    }
+    if (count != values.size() || camera.halfHeight.IsZero()) {
+        error = "Coordinates must contain exactly three values with a non-zero scale.";
+        return false;
+    }
+    return true;
+}
+
 bool CopyUnicodeText(HWND owner, const std::wstring& text) {
     if (!OpenClipboard(owner)) return false;
     EmptyClipboard();
@@ -319,20 +377,29 @@ bool AppWindow::Create(HINSTANCE instance, int showCommand, bool startHidden, st
         ShowWindow(window_, showCommand);
         UpdateWindow(window_);
     }
-    if (settings_.general.startWallpaperOnLaunch || settings_.lastWallpaperRunning) {
-        if (settings_.staticWallpaper.enabled && !settings_.staticWallpaper.imagePaths.empty()) StartSavedStaticWallpaper();
-        else SetWallpaper();
+    if (settings_.general.defaultDesktopMode != DesktopMode::None) {
+        ApplyDesktopMode(settings_.general.defaultDesktopMode);
     }
     return true;
 }
 
 int AppWindow::RunMessageLoop() {
+    std::array<ACCEL, 2> acceleratorEntries{{
+        {static_cast<BYTE>(FVIRTKEY | FCONTROL), static_cast<WORD>('Z'), UndoButton},
+        {static_cast<BYTE>(FVIRTKEY | FCONTROL), static_cast<WORD>('Y'), RedoButton},
+    }};
+    HACCEL accelerators = CreateAcceleratorTableW(
+        acceleratorEntries.data(), static_cast<int>(acceleratorEntries.size()));
     MSG message{};
     while (GetMessageW(&message, nullptr, 0, 0) > 0) {
         if (quickController_.ProcessDialogMessage(message)) continue;
+        if (accelerators && TranslateAcceleratorW(window_, accelerators, &message)) continue;
+        if ((message.hwnd == window_ || IsChild(window_, message.hwnd)) &&
+            ProcessKeyboardDialogMessage(window_, message)) continue;
         TranslateMessage(&message);
         DispatchMessageW(&message);
     }
+    if (accelerators) DestroyAcceleratorTable(accelerators);
     return static_cast<int>(message.wParam);
 }
 
@@ -368,9 +435,8 @@ bool AppWindow::RegisterClasses(std::string& error) {
 }
 
 void AppWindow::CreateControls() {
-    uiFont_ = CreateFontW(-16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
-                          OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
-                          DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+    mainDpi_ = DialogDpi(window_);
+    uiFont_ = CreateResponsiveDialogFont(mainDpi_);
 
     previewWindow_ = CreateWindowExW(WS_EX_CLIENTEDGE, kPreviewClass, L"", WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS,
                                      0, 0, 100, 100, window_, nullptr, instance_, this);
@@ -401,14 +467,13 @@ void AppWindow::CreateControls() {
     centreYEdit_ = MakeControl(WS_EX_CLIENTEDGE, L"EDIT", L"", ES_AUTOHSCROLL | WS_TABSTOP, CentreYEdit, window_, instance_);
     staticLabel(L"View scale");
     scaleEdit_ = MakeControl(WS_EX_CLIENTEDGE, L"EDIT", L"", ES_AUTOHSCROLL | WS_TABSTOP, ScaleEdit, window_, instance_);
-    staticLabel(L"Coordinates  X, Y, Scale");
+    staticLabel(L"X, Y, Scale");
     coordinatesEdit_ = MakeControl(WS_EX_CLIENTEDGE, L"EDIT", L"", ES_AUTOHSCROLL | WS_TABSTOP, CoordinatesEdit, window_, instance_);
+    staticLabel(L"Rotation (degrees)");
+    rotationEdit_ = MakeControl(WS_EX_CLIENTEDGE, L"EDIT", L"", ES_AUTOHSCROLL | WS_TABSTOP, RotationEdit, window_, instance_);
     staticLabel(L"Palette");
     paletteCombo_ = MakeControl(0, WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, PaletteCombo, window_, instance_);
     MakeControl(0, L"BUTTON", L"Edit Palette...", BS_PUSHBUTTON | WS_TABSTOP, PaletteEditorButton, window_, instance_);
-    staticLabel(L"Animation");
-    animationCombo_ = MakeControl(0, WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, AnimationCombo, window_, instance_);
-    staticLabel(L"Equation");
     MakeControl(0, L"BUTTON", L"Edit Equation...", BS_PUSHBUTTON | WS_TABSTOP, EquationEditorButton, window_, instance_);
 
     auto makeNumericEdit = [&](int id) {
@@ -446,20 +511,27 @@ void AppWindow::CreateControls() {
     performanceCombo_ = MakeControl(0, WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, PerformanceCombo, window_, instance_);
     staticLabel(L"Monitor mode");
     monitorModeCombo_ = MakeControl(0, WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, MonitorModeCombo, window_, instance_);
-    staticLabel(L"Target monitor");
-    monitorCombo_ = MakeControl(0, WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, MonitorCombo, window_, instance_);
-    staticLabel(L"Assigned preset");
-    monitorAssignmentCombo_ = MakeControl(0, WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, MonitorAssignmentCombo, window_, instance_);
 
-    MakeControl(0, L"BUTTON", L"Apply Preview as Live Wallpaper", BS_DEFPUSHBUTTON | WS_TABSTOP, SetWallpaperButton, window_, instance_);
+    MakeControl(0, L"BUTTON", L"Use Exported Video...", BS_DEFPUSHBUTTON | WS_TABSTOP, SetWallpaperButton, window_, instance_);
     MakeControl(0, L"BUTTON", L"Capture Preview as Static", BS_PUSHBUTTON | WS_TABSTOP, SetStaticWallpaperButton, window_, instance_);
     MakeControl(0, L"BUTTON", L"Add Preview to Slideshow", BS_PUSHBUTTON | WS_TABSTOP, AddSlideshowButton, window_, instance_);
     MakeControl(0, L"BUTTON", L"Manage Slideshow...", BS_PUSHBUTTON | WS_TABSTOP, ManageSlideshowButton, window_, instance_);
+    staticLabel(L"Desktop mode");
+    desktopModeCombo_ = MakeControl(0, WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, DesktopModeCombo, window_, instance_);
+    MakeControl(0, L"BUTTON", L"Apply", BS_DEFPUSHBUTTON | WS_TABSTOP, ApplyDesktopModeButton, window_, instance_);
+    MakeControl(0, L"BUTTON", L"Set as default", BS_AUTOCHECKBOX | WS_TABSTOP, DefaultDesktopModeCheck, window_, instance_);
+    MakeControl(0, L"BUTTON", L"Journey Settings...", BS_PUSHBUTTON | WS_TABSTOP, JourneySettingsButton, window_, instance_);
+    MakeControl(0, L"BUTTON", L"Animation Timeline...", BS_PUSHBUTTON | WS_TABSTOP, GeneralAnimationButton, window_, instance_);
     MakeControl(0, L"BUTTON", L"Open Quick Controller", BS_PUSHBUTTON | WS_TABSTOP, OpenControllerButton, window_, instance_);
     pauseButton_ = MakeControl(0, L"BUTTON", L"Pause", BS_PUSHBUTTON | WS_TABSTOP, PauseButton, window_, instance_);
     MakeControl(0, L"BUTTON", L"Stop Wallpaper", BS_PUSHBUTTON | WS_TABSTOP, StopButton, window_, instance_);
+    MakeControl(0, L"BUTTON", L"Undo", BS_PUSHBUTTON | WS_TABSTOP, UndoButton, window_, instance_);
+    MakeControl(0, L"BUTTON", L"Redo", BS_PUSHBUTTON | WS_TABSTOP, RedoButton, window_, instance_);
     MakeControl(0, L"BUTTON", L"Reset View", BS_PUSHBUTTON | WS_TABSTOP, ResetViewButton, window_, instance_);
-    MakeControl(0, L"BUTTON", L"Render Hi-Res and Save...", BS_PUSHBUTTON | WS_TABSTOP, RenderHighResButton, window_, instance_);
+    MakeControl(0, L"BUTTON", L"Fractal Scout...", BS_PUSHBUTTON | WS_TABSTOP, FractalScoutButton, window_, instance_);
+    MakeControl(0, L"BUTTON", L"Render Hi-Res...", BS_PUSHBUTTON | WS_TABSTOP, RenderHighResButton, window_, instance_);
+    MakeControl(0, L"BUTTON", L"Export Frames...", BS_PUSHBUTTON | WS_TABSTOP, ExportFramesButton, window_, instance_);
+    MakeControl(0, L"BUTTON", L"Encode MP4...", BS_PUSHBUTTON | WS_TABSTOP, ExportVideoButton, window_, instance_);
     MakeControl(0, L"BUTTON", L"Save as New", BS_PUSHBUTTON | WS_TABSTOP, SaveNewButton, window_, instance_);
     MakeControl(0, L"BUTTON", L"Save Changes", BS_PUSHBUTTON | WS_TABSTOP, SaveChangesButton, window_, instance_);
     MakeControl(0, L"BUTTON", L"Restore Built-ins", BS_PUSHBUTTON | WS_TABSTOP, RestoreBuiltInsButton, window_, instance_);
@@ -468,7 +540,6 @@ void AppWindow::CreateControls() {
     MakeControl(0, L"BUTTON", L"Delete Custom", BS_PUSHBUTTON | WS_TABSTOP, DeletePresetButton, window_, instance_);
     MakeControl(0, L"BUTTON", L"Import", BS_PUSHBUTTON | WS_TABSTOP, ImportPresetButton, window_, instance_);
     MakeControl(0, L"BUTTON", L"Export", BS_PUSHBUTTON | WS_TABSTOP, ExportPresetButton, window_, instance_);
-    MakeControl(0, L"BUTTON", L"Apply Assignment", BS_PUSHBUTTON | WS_TABSTOP, AssignMonitorButton, window_, instance_);
 
     MakeControl(0, L"BUTTON", L"Start with Windows", BS_AUTOCHECKBOX | WS_TABSTOP, StartupCheck, window_, instance_);
     MakeControl(0, L"BUTTON", L"Pause for full-screen apps", BS_AUTOCHECKBOX | WS_TABSTOP, FullscreenCheck, window_, instance_);
@@ -509,10 +580,19 @@ void AppWindow::CreateControls() {
         previewRendererError_.clear();
     }
     PopulateControls();
+    UpdateHistoryCommands();
     ShowSelectedTab();
 }
 
 void AppWindow::LayoutControls(int width, int height) {
+    const UINT dpi = std::clamp(mainDpi_, 48U, 768U);
+    width = MulDiv(width, 96, static_cast<int>(dpi));
+    height = MulDiv(height, 96, static_cast<int>(dpi));
+    const auto scale = [dpi](int value) { return MulDiv(value, static_cast<int>(dpi), 96); };
+    const auto moveControl = [&](HWND control, int x, int y, int controlWidth,
+                                 int controlHeight, BOOL repaint) {
+        MoveWindow(control, scale(x), scale(y), scale(controlWidth), scale(controlHeight), repaint);
+    };
     const int margin = 10;
     const int gap = 8;
     const int navigationWidth = 76;
@@ -520,17 +600,17 @@ void AppWindow::LayoutControls(int width, int height) {
     const int previewWidth = std::max(360, width - panelWidth - navigationWidth - margin * 2 - gap * 2);
     const int contentHeight = std::max(520, height - margin * 2);
 
-    MoveWindow(previewWindow_, margin, margin, previewWidth, contentHeight, TRUE);
+    moveControl(previewWindow_, margin, margin, previewWidth, contentHeight, TRUE);
     const int navigationX = margin + previewWidth + gap;
     const int panelX = navigationX + navigationWidth + gap;
-    MoveWindow(mainTab_, 0, 0, 0, 0, FALSE);
-    MoveWindow(navigationPreviewButton_, navigationX, margin, navigationWidth, 66, TRUE);
-    MoveWindow(navigationWallpaperButton_, navigationX, margin + 72, navigationWidth, 66, TRUE);
-    MoveWindow(navigationDiagnosticsButton_, navigationX, margin + 144, navigationWidth, 66, TRUE);
-    MoveWindow(navigationSettingsButton_, navigationX, margin + 216, navigationWidth, 66, TRUE);
-    MoveWindow(navigationPaletteButton_, navigationX, margin + 288, navigationWidth, 66, TRUE);
-    MoveWindow(navigationControllerButton_, navigationX, margin + 360, navigationWidth, 66, TRUE);
-    MoveWindow(navigationEquationButton_, navigationX, margin + 432, navigationWidth, 66, TRUE);
+    moveControl(mainTab_, 0, 0, 0, 0, FALSE);
+    moveControl(navigationPreviewButton_, navigationX, margin, navigationWidth, 66, TRUE);
+    moveControl(navigationWallpaperButton_, navigationX, margin + 72, navigationWidth, 66, TRUE);
+    moveControl(navigationDiagnosticsButton_, navigationX, margin + 144, navigationWidth, 66, TRUE);
+    moveControl(navigationSettingsButton_, navigationX, margin + 216, navigationWidth, 66, TRUE);
+    moveControl(navigationPaletteButton_, navigationX, margin + 288, navigationWidth, 66, TRUE);
+    moveControl(navigationControllerButton_, navigationX, margin + 360, navigationWidth, 66, TRUE);
+    moveControl(navigationEquationButton_, navigationX, margin + 432, navigationWidth, 66, TRUE);
 
     RECT page{panelX, margin, panelX + panelWidth, margin + contentHeight};
     const int x = page.left;
@@ -563,53 +643,54 @@ void AppWindow::LayoutControls(int width, int height) {
         if (HWND control = GetDlgItem(window_, id)) ShowWindow(control, visible ? SW_SHOW : SW_HIDE);
     };
 
-    for (HWND control : {presetCombo_, presetNameEdit_, centreXEdit_, centreYEdit_, scaleEdit_, coordinatesEdit_, paletteCombo_,
-                         animationCombo_, iterationsTrack_, fpsTrack_, renderScaleTrack_, zoomSpeedTrack_,
+    for (HWND control : {presetCombo_, presetNameEdit_, centreXEdit_, centreYEdit_, scaleEdit_, coordinatesEdit_, rotationEdit_, paletteCombo_,
+                         desktopModeCombo_, iterationsTrack_, fpsTrack_, renderScaleTrack_, zoomSpeedTrack_,
                          colourSpeedTrack_, brightnessTrack_, contrastTrack_, saturationTrack_, colourOffsetTrack_,
-                         performanceCombo_, monitorModeCombo_, monitorCombo_, monitorAssignmentCombo_}) {
+                         performanceCombo_, monitorModeCombo_}) {
         pairVisible(control, false);
     }
     for (int id : {PreviewContextLabel, WallpaperContextLabel, PresetLibraryButton,
                    PaletteEditorButton, EquationEditorButton, IterationsEdit, FpsEdit, RenderScaleEdit,
                    ColourCycleButton, BrightnessEdit, ContrastEdit, SaturationEdit, ColourOffsetEdit,
                    SetWallpaperButton, SetStaticWallpaperButton, AddSlideshowButton, ManageSlideshowButton,
-                   PauseButton, StopButton, ResetViewButton, SaveNewButton, SaveChangesButton,
+                   ApplyDesktopModeButton, DefaultDesktopModeCheck, JourneySettingsButton, GeneralAnimationButton,
+                   PauseButton, StopButton, UndoButton, RedoButton, ResetViewButton, SaveNewButton, SaveChangesButton,
                    RestoreBuiltInsButton, OpenSettingsButton, ConfigurePrecisionButton, DeletePresetButton,
-                   ImportPresetButton, ExportPresetButton, AssignMonitorButton, StartupCheck, FullscreenCheck,
+                   ImportPresetButton, ExportPresetButton, StartupCheck, FullscreenCheck,
                    BatteryCheck, RemoteCheck, ReducedMotionCheck, StatusLabel, FpsLabel, ProfileLabel,
                    MonitorInfoLabel, PrecisionLabel, OpenLogsButton, CopyDiagnosticsButton, ClearLogsButton,
-                   OpenControllerButton, RenderHighResButton}) {
+                   OpenControllerButton, FractalScoutButton, RenderHighResButton, ExportFramesButton, ExportVideoButton}) {
         showId(id, false);
     }
 
     auto heading = [&](HWND control) {
         ShowWindow(control, SW_SHOW);
-        MoveWindow(control, x, y, full, 26, TRUE);
+        moveControl(control, x, y, full, 26, TRUE);
         y += 34;
     };
     auto pair = [&](HWND control, int h = 0) {
         if (h <= 0) h = rowHeight;
         pairVisible(control, true);
-        if (HWND label = findPrevStatic(control)) MoveWindow(label, x, y + 4, labelWidth, 20, TRUE);
+        if (HWND label = findPrevStatic(control)) moveControl(label, x, y + 4, labelWidth, 20, TRUE);
         wchar_t className[32]{};
         GetClassNameW(control, className, static_cast<int>(std::size(className)));
         const int windowHeight = wcscmp(className, WC_COMBOBOXW) == 0 ? h + 150 : h;
-        MoveWindow(control, controlX, y, controlWidth, windowHeight, TRUE);
+        moveControl(control, controlX, y, controlWidth, windowHeight, TRUE);
         y += h + rowGap;
     };
     auto sliderEdit = [&](HWND track, HWND edit, int h = 0) {
         if (h <= 0) h = sliderHeight;
         pairVisible(track, true);
         ShowWindow(edit, SW_SHOW);
-        if (HWND label = findPrevStatic(track)) MoveWindow(label, x, y + 4, labelWidth, 20, TRUE);
-        MoveWindow(track, controlX, y, std::max(90, controlWidth - editWidth - 6), h, TRUE);
-        MoveWindow(edit, controlX + controlWidth - editWidth, y + 1, editWidth, 24, TRUE);
+        if (HWND label = findPrevStatic(track)) moveControl(label, x, y + 4, labelWidth, 20, TRUE);
+        moveControl(track, controlX, y, std::max(90, controlWidth - editWidth - 6), h, TRUE);
+        moveControl(edit, controlX + controlWidth - editWidth, y + 1, editWidth, 24, TRUE);
         y += h + rowGap;
     };
     auto button = [&](int id, int bx, int by, int bw, int bh = 30) {
         if (HWND control = GetDlgItem(window_, id)) {
             ShowWindow(control, SW_SHOW);
-            MoveWindow(control, bx, by, bw, bh, TRUE);
+            moveControl(control, bx, by, bw, bh, TRUE);
         }
     };
 
@@ -618,43 +699,62 @@ void AppWindow::LayoutControls(int width, int height) {
         button(PresetLibraryButton, x, y, full, 32);
         y += 40;
         pair(coordinatesEdit_);
+        pair(rotationEdit_);
 
         pair(paletteCombo_);
-        pair(animationCombo_);
         sliderEdit(iterationsTrack_, iterationsEdit_);
         pair(zoomSpeedTrack_, sliderHeight);
 
         const int colourY = y;
         pair(colourSpeedTrack_, sliderHeight);
         const int cycleWidth = 108;
-        MoveWindow(colourSpeedTrack_, controlX, colourY, controlWidth - cycleWidth - 6, sliderHeight, TRUE);
+        moveControl(colourSpeedTrack_, controlX, colourY, controlWidth - cycleWidth - 6, sliderHeight, TRUE);
         button(ColourCycleButton, controlX + controlWidth - cycleWidth, colourY, cycleWidth, sliderHeight);
         sliderEdit(brightnessTrack_, brightnessEdit_);
         sliderEdit(contrastTrack_, contrastEdit_);
         sliderEdit(saturationTrack_, saturationEdit_);
         sliderEdit(colourOffsetTrack_, colourOffsetEdit_);
 
-        const int baseY = std::min(y + 8, static_cast<int>(page.bottom - 76));
-        button(ResetViewButton, x, baseY, full, 32);
-        button(RenderHighResButton, x, baseY + 38, full, 32);
+        const int baseY = std::min(y + 8, static_cast<int>(page.bottom - 190));
+        const int historyWidth = (full - 6) / 2;
+        button(UndoButton, x, baseY, historyWidth, 32);
+        button(RedoButton, x + historyWidth + 6, baseY, full - historyWidth - 6, 32);
+        button(ResetViewButton, x, baseY + 38, full, 32);
+        const int animationWidth = (full - 6) / 2;
+        button(JourneySettingsButton, x, baseY + 76, animationWidth, 32);
+        button(GeneralAnimationButton, x + animationWidth + 6, baseY + 76,
+               full - animationWidth - 6, 32);
+        button(FractalScoutButton, x, baseY + 114, full, 32);
+        const int exportGap = 6;
+        const int exportWidth = (full - exportGap * 2) / 3;
+        button(RenderHighResButton, x, baseY + 152, exportWidth, 32);
+        button(ExportFramesButton, x + exportWidth + exportGap, baseY + 152,
+               exportWidth, 32);
+        button(ExportVideoButton, x + (exportWidth + exportGap) * 2, baseY + 152,
+               full - (exportWidth + exportGap) * 2, 32);
     } else if (selectedTab_ == 1) {
         heading(wallpaperContextLabel_);
+        pair(desktopModeCombo_);
+        button(ApplyDesktopModeButton, x, y, full, 32); y += 40;
+        button(DefaultDesktopModeCheck, x, y, full, 28); y += 34;
+        button(JourneySettingsButton, x, y, full, 32); y += 40;
+        button(GeneralAnimationButton, x, y, full, 32); y += 40;
         for (HWND label : {statusLabel_, fpsLabel_, monitorInfoLabel_}) ShowWindow(label, SW_SHOW);
-        MoveWindow(statusLabel_, x, y, full, 42, TRUE); y += 48;
-        MoveWindow(fpsLabel_, x, y, full, 42, TRUE); y += 48;
-        MoveWindow(monitorInfoLabel_, x, y, full, 72, TRUE); y += 80;
+        moveControl(statusLabel_, x, y, full, 42, TRUE); y += 48;
+        moveControl(fpsLabel_, x, y, full, 42, TRUE); y += 48;
+        moveControl(monitorInfoLabel_, x, y, full, 72, TRUE); y += 80;
         button(ManageSlideshowButton, x, y, full, 34); y += 42;
         ShowWindow(wallpaperContextLabel_, SW_SHOW);
         SetControlText(wallpaperContextLabel_,
-            "Desktop actions are available from the preview hover menu and Quick Controller. Graphics, monitor and pause behaviour are configured in Settings.");
-        MoveWindow(wallpaperContextLabel_, x, page.bottom - 82, full, 72, TRUE);
+            "Choose a desktop mode, then press Apply. Tick Set as default to start that mode automatically on the next launch.");
+        moveControl(wallpaperContextLabel_, x, page.bottom - 82, full, 72, TRUE);
     } else {
         for (HWND label : {statusLabel_, fpsLabel_, profileLabel_, monitorInfoLabel_, precisionLabel_}) ShowWindow(label, SW_SHOW);
-        MoveWindow(statusLabel_, x, y, full, 36, TRUE); y += 42;
-        MoveWindow(fpsLabel_, x, y, full, 42, TRUE); y += 48;
-        MoveWindow(profileLabel_, x, y, full, 52, TRUE); y += 58;
-        MoveWindow(monitorInfoLabel_, x, y, full, 72, TRUE); y += 78;
-        MoveWindow(precisionLabel_, x, y, full, 92, TRUE); y += 100;
+        moveControl(statusLabel_, x, y, full, 36, TRUE); y += 42;
+        moveControl(fpsLabel_, x, y, full, 42, TRUE); y += 48;
+        moveControl(profileLabel_, x, y, full, 52, TRUE); y += 58;
+        moveControl(monitorInfoLabel_, x, y, full, 72, TRUE); y += 78;
+        moveControl(precisionLabel_, x, y, full, 92, TRUE); y += 100;
         const int bw = (full - 12) / 3;
         button(OpenLogsButton, x, y, bw);
         button(CopyDiagnosticsButton, x + bw + 6, y, bw);
@@ -674,9 +774,10 @@ void AppWindow::LayoutControls(int width, int height) {
 void AppWindow::PopulateControls() {
     PopulatePresetCombo();
     for (const wchar_t* item : {L"Classic Spectrum", L"Deep Ocean", L"Fire", L"Purple Neon", L"Green Matrix", L"Gold", L"Ice", L"Greyscale", L"Pastel", L"High Contrast"}) AddComboItem(paletteCombo_, item);
-    for (const wchar_t* item : {L"Automatic Journey", L"Continuous Zoom", L"Static Animated Colour", L"Manual View"}) AddComboItem(animationCombo_, item);
+    for (const wchar_t* item : {L"None", L"Static image", L"Slide show", L"Video file"}) AddComboItem(desktopModeCombo_, item);
+    SendMessageW(desktopModeCombo_, CB_SETCURSEL, static_cast<WPARAM>(settings_.general.defaultDesktopMode), 0);
     for (const wchar_t* item : {L"Battery Saver", L"Balanced", L"High Quality", L"Custom"}) AddComboItem(performanceCombo_, item);
-    for (const wchar_t* item : {L"Mirror", L"Span", L"Independent"}) AddComboItem(monitorModeCombo_, item);
+    for (const wchar_t* item : {L"Mirror", L"Span"}) AddComboItem(monitorModeCombo_, item);
     SendMessageW(performanceCombo_, CB_SETCURSEL, static_cast<WPARAM>(settings_.performance.profile), 0);
     SendMessageW(monitorModeCombo_, CB_SETCURSEL, static_cast<WPARAM>(settings_.monitorMode), 0);
     settings_.general.startWithWindows = StartupManager::IsEnabled();
@@ -686,7 +787,10 @@ void AppWindow::PopulateControls() {
     SetCheck(GetDlgItem(window_, RemoteCheck), settings_.performance.pauseDuringRemoteDesktop);
     SetCheck(GetDlgItem(window_, ReducedMotionCheck), settings_.general.reducedMotion);
     PopulateMonitorControls();
-    LoadSelectedPreset();
+    LoadSelectedPreset({ParameterMutationOrigin::PresetLoad,
+                        ProjectPresetReplacementKind::PresetLoad,
+                        false});
+    UpdateDesktopModeControls();
 }
 
 void AppWindow::PopulatePresetCombo() {
@@ -699,31 +803,14 @@ void AppWindow::PopulatePresetCombo() {
     }
     SendMessageW(presetCombo_, CB_SETCURSEL, selected, 0);
 
-    SendMessageW(monitorAssignmentCombo_, CB_RESETCONTENT, 0, 0);
-    for (const auto& preset : presets) AddComboItem(monitorAssignmentCombo_, ToWide(preset.name));
-    SendMessageW(monitorAssignmentCombo_, CB_SETCURSEL, selected, 0);
 }
 
 void AppWindow::PopulateMonitorControls() {
-    const int previousSelection = SelectedComboIndex(monitorCombo_);
-    SendMessageW(monitorCombo_, CB_RESETCONTENT, 0, 0);
     const auto displays = DisplayManager::Enumerate();
-    for (const auto& display : displays) {
-        std::wostringstream text;
-        text << display.friendlyName << L" (" << (display.bounds.right - display.bounds.left) << L"x" << (display.bounds.bottom - display.bounds.top)
-             << L", " << display.dpiX << L" DPI" << (display.primary ? L", primary" : L"") << L")";
-        AddComboItem(monitorCombo_, text.str());
-    }
-    if (!displays.empty()) {
-        SendMessageW(monitorCombo_, CB_SETCURSEL,
-                     std::clamp(previousSelection, 0, static_cast<int>(displays.size()) - 1), 0);
-    }
     std::ostringstream info;
     info << "Detected monitors: " << displays.size() << ". Mode: " << ToString(settings_.monitorMode)
-         << ". Span uses one continuous virtual-desktop canvas; Independent uses the assignments below.";
+         << ". Mirror repeats one image per display; Span uses one continuous virtual-desktop canvas.";
     SetControlText(monitorInfoLabel_, info.str());
-    LoadMonitorAssignmentSelection();
-    UpdateMonitorAssignmentControls();
 }
 
 void AppWindow::ShowSelectedTab() {
@@ -735,32 +822,6 @@ void AppWindow::ShowSelectedTab() {
 void AppWindow::SelectPage(int page) {
     selectedTab_ = std::clamp(page, 0, 2);
     ShowSelectedTab();
-}
-
-void AppWindow::UpdateMonitorAssignmentControls() {
-    const bool independent = settings_.monitorMode == MonitorMode::Independent;
-    EnableWindow(monitorCombo_, independent);
-    EnableWindow(monitorAssignmentCombo_, independent);
-    EnableWindow(GetDlgItem(window_, AssignMonitorButton), independent);
-}
-
-void AppWindow::LoadMonitorAssignmentSelection() {
-    const auto displays = DisplayManager::Enumerate();
-    const auto presets = AllPresets();
-    const int monitorIndex = SelectedComboIndex(monitorCombo_);
-    if (monitorIndex < 0 || monitorIndex >= static_cast<int>(displays.size())) return;
-    const std::string key = ToUtf8(displays[static_cast<std::size_t>(monitorIndex)].deviceName);
-    std::string presetId = settings_.selectedPresetId;
-    const auto assignment = settings_.monitorPresetAssignments.find(key);
-    if (assignment != settings_.monitorPresetAssignments.end()) presetId = assignment->second;
-    int selection = 0;
-    for (std::size_t i = 0; i < presets.size(); ++i) {
-        if (presets[i].id == presetId) {
-            selection = static_cast<int>(i);
-            break;
-        }
-    }
-    SendMessageW(monitorAssignmentCombo_, CB_SETCURSEL, selection, 0);
 }
 
 void AppWindow::SyncNumericEditsFromTracks() {
@@ -800,6 +861,231 @@ void AppWindow::SyncTrackFromNumericEdit(int controlId) {
     SyncNumericEditsFromTracks();
 }
 
+bool AppWindow::ApplyMainWindowPaletteSelection(bool refreshPreview) {
+    previewGestureCoalescer_.Reset();
+    const int selected = SelectedComboIndex(paletteCombo_);
+    if (selected < static_cast<int>(Palette::ClassicSpectrum) ||
+        selected > static_cast<int>(Palette::HighContrast)) {
+        SendMessageW(paletteCombo_, CB_SETCURSEL,
+                     static_cast<WPARAM>(workingPreset_.palette), 0);
+        return false;
+    }
+
+    const Preset before = workingPreset_;
+    ParameterMutationResult result;
+    std::string error;
+    if (!ApplyProjectPaletteSelection(
+            workingPreset_, static_cast<Palette>(selected), true, result, error,
+            {ParameterMutationOrigin::UserControl})) {
+        LogError("Main-window palette selection rejected: " + error);
+        SendMessageW(paletteCombo_, CB_SETCURSEL,
+                     static_cast<WPARAM>(workingPreset_.palette), 0);
+        return false;
+    }
+    (void)RecordProjectHistory(before, result, "Select Palette");
+
+    const std::wstring paletteButtonText = workingPreset_.customPaletteColours.empty()
+        ? L"Edit Palette..."
+        : L"Custom (" + std::to_wstring(workingPreset_.customPaletteColours.size()) + L")";
+    SetWindowTextW(GetDlgItem(window_, PaletteEditorButton), paletteButtonText.c_str());
+    if (!refreshPreview || !result.changed) return true;
+
+    previewAnimation_.SetPreset(workingPreset_, settings_.general.reducedMotion);
+    previewAnimation_.SetColourCyclingEnabled(previewColourCyclingEnabled_);
+    previewAnimation_.SetMotionEnabled(zoomMotionEnabled_);
+    previewChangesPending_ = true;
+    if (HasParameterInvalidation(result.invalidationMask,
+                                 ParameterInvalidation::PaletteColouring)) {
+        previewForceRender_ = true;
+    }
+    UpdateStatus();
+    return true;
+}
+
+bool AppWindow::ApplyMainWindowPalettePostControls(bool refreshPreview) {
+    const Preset before = workingPreset_;
+    const std::array<ParameterMutation, 4> mutations{{
+        {ParameterKey::Brightness,
+         static_cast<double>(SendMessageW(brightnessTrack_, TBM_GETPOS, 0, 0)) / 100.0},
+        {ParameterKey::Contrast,
+         static_cast<double>(SendMessageW(contrastTrack_, TBM_GETPOS, 0, 0)) / 100.0},
+        {ParameterKey::Saturation,
+         static_cast<double>(SendMessageW(saturationTrack_, TBM_GETPOS, 0, 0)) / 100.0},
+        {ParameterKey::PaletteOffset,
+         (static_cast<double>(SendMessageW(colourOffsetTrack_, TBM_GETPOS, 0, 0)) - 100.0) / 100.0},
+    }};
+    ParameterMutationContext context{ParameterMutationOrigin::UserControl,
+                                     ParameterGestureKind::None, 0U};
+    const std::uint64_t paletteGestureToken =
+        previewGestureCoalescer_.ActiveToken(ParameterGestureKind::PaletteControl);
+    if (paletteGestureToken != 0U) {
+        context.origin = ParameterMutationOrigin::UserGesture;
+        context.gestureKind = ParameterGestureKind::PaletteControl;
+        context.coalescingToken = paletteGestureToken;
+    }
+    ParameterMutationResult result;
+    std::string error;
+    if (!ApplyProjectParameterMutations(
+            workingPreset_, mutations, result, error, context)) {
+        LogError("Main-window palette/post mutation rejected: " + error);
+        SendMessageW(brightnessTrack_, TBM_SETPOS, TRUE,
+                     static_cast<LPARAM>(std::lround(workingPreset_.brightness * 100.0)));
+        SendMessageW(contrastTrack_, TBM_SETPOS, TRUE,
+                     static_cast<LPARAM>(std::lround(workingPreset_.contrast * 100.0)));
+        SendMessageW(saturationTrack_, TBM_SETPOS, TRUE,
+                     static_cast<LPARAM>(std::lround(workingPreset_.saturation * 100.0)));
+        SendMessageW(colourOffsetTrack_, TBM_SETPOS, TRUE,
+                     static_cast<LPARAM>(std::lround((workingPreset_.colourOffset + 1.0) * 100.0)));
+        SyncNumericEditsFromTracks();
+        return false;
+    }
+    if (result.normalised) {
+        SendMessageW(brightnessTrack_, TBM_SETPOS, TRUE,
+                     static_cast<LPARAM>(std::lround(workingPreset_.brightness * 100.0)));
+        SendMessageW(contrastTrack_, TBM_SETPOS, TRUE,
+                     static_cast<LPARAM>(std::lround(workingPreset_.contrast * 100.0)));
+        SendMessageW(saturationTrack_, TBM_SETPOS, TRUE,
+                     static_cast<LPARAM>(std::lround(workingPreset_.saturation * 100.0)));
+        SendMessageW(colourOffsetTrack_, TBM_SETPOS, TRUE,
+                     static_cast<LPARAM>(std::lround((workingPreset_.colourOffset + 1.0) * 100.0)));
+        SyncNumericEditsFromTracks();
+    }
+    (void)RecordProjectHistory(before, result, "Adjust Palette Offset");
+    if (!refreshPreview || !result.changed) return true;
+
+    previewAnimation_.SetPreset(workingPreset_, settings_.general.reducedMotion);
+    previewAnimation_.SetColourCyclingEnabled(previewColourCyclingEnabled_);
+    previewAnimation_.SetMotionEnabled(zoomMotionEnabled_);
+    previewChangesPending_ = true;
+    if (HasParameterInvalidation(result.invalidationMask,
+                                 ParameterInvalidation::PaletteColouring) ||
+        HasParameterInvalidation(result.invalidationMask,
+                                 ParameterInvalidation::PostProcessing)) {
+        previewForceRender_ = true;
+    }
+    UpdateStatus();
+    return true;
+}
+
+
+bool AppWindow::RecordProjectHistory(const Preset& before,
+                                     const ParameterMutationResult& result,
+                                     const std::string& label) {
+    std::string error;
+    if (!projectHistory_.RecordParameterMutation(before, workingPreset_, result, label, error)) {
+        LogWarning("Project history entry was not recorded: " + error);
+        UpdateHistoryCommands();
+        return false;
+    }
+    UpdateHistoryCommands();
+    return true;
+}
+
+void AppWindow::UndoProjectEdit() {
+    if (draggingPreview_ ||
+        previewGestureCoalescer_.ActiveToken(ParameterGestureKind::PaletteControl) != 0U) {
+        MessageBeep(MB_ICONINFORMATION);
+        return;
+    }
+    previewGestureCoalescer_.Reset();
+    ProjectHistoryApplyResult result;
+    std::string error;
+    if (!projectHistory_.Undo(workingPreset_, result, error)) {
+        LogError("Undo failed: " + error);
+        MessageBoxW(window_, ToWide("Undo failed: " + error).c_str(),
+                    L"Undo", MB_OK | MB_ICONERROR);
+        return;
+    }
+    if (result.changed) RefreshAfterProjectHistory(result);
+    else UpdateHistoryCommands();
+}
+
+void AppWindow::RedoProjectEdit() {
+    if (draggingPreview_ ||
+        previewGestureCoalescer_.ActiveToken(ParameterGestureKind::PaletteControl) != 0U) {
+        MessageBeep(MB_ICONINFORMATION);
+        return;
+    }
+    previewGestureCoalescer_.Reset();
+    ProjectHistoryApplyResult result;
+    std::string error;
+    if (!projectHistory_.Redo(workingPreset_, result, error)) {
+        LogError("Redo failed: " + error);
+        MessageBoxW(window_, ToWide("Redo failed: " + error).c_str(),
+                    L"Redo", MB_OK | MB_ICONERROR);
+        return;
+    }
+    if (result.changed) RefreshAfterProjectHistory(result);
+    else UpdateHistoryCommands();
+}
+
+void AppWindow::RefreshAfterProjectHistory(const ProjectHistoryApplyResult& result) {
+    settings_.selectedPresetId = workingPreset_.id;
+    const auto presets = AllPresets();
+    const auto selected = std::find_if(
+        presets.begin(), presets.end(),
+        [&](const Preset& preset) { return preset.id == workingPreset_.id; });
+    if (selected != presets.end()) {
+        SendMessageW(presetCombo_, CB_SETCURSEL,
+                     static_cast<WPARAM>(std::distance(presets.begin(), selected)), 0);
+    }
+
+    SetControlText(presetNameEdit_, workingPreset_.name);
+    SyncMainWindowCameraControls();
+    SetWindowTextW(presetLibraryButton_,
+                   ToWide("Preset: " + workingPreset_.name + "...").c_str());
+    SendMessageW(paletteCombo_, CB_SETCURSEL,
+                 static_cast<WPARAM>(workingPreset_.palette), 0);
+    SendMessageW(iterationsTrack_, TBM_SETPOS, TRUE, workingPreset_.maximumIterations);
+    SendMessageW(zoomSpeedTrack_, TBM_SETPOS, TRUE,
+                 static_cast<LPARAM>(std::lround(workingPreset_.zoomSpeed * 100.0)));
+    SendMessageW(colourSpeedTrack_, TBM_SETPOS, TRUE,
+                 static_cast<LPARAM>(std::lround(std::abs(workingPreset_.colourCycleSpeed) * 100.0)));
+    SendMessageW(brightnessTrack_, TBM_SETPOS, TRUE,
+                 static_cast<LPARAM>(std::lround(workingPreset_.brightness * 100.0)));
+    SendMessageW(contrastTrack_, TBM_SETPOS, TRUE,
+                 static_cast<LPARAM>(std::lround(workingPreset_.contrast * 100.0)));
+    SendMessageW(saturationTrack_, TBM_SETPOS, TRUE,
+                 static_cast<LPARAM>(std::lround(workingPreset_.saturation * 100.0)));
+    SendMessageW(colourOffsetTrack_, TBM_SETPOS, TRUE,
+                 static_cast<LPARAM>(std::lround((workingPreset_.colourOffset + 1.0) * 100.0)));
+    SyncNumericEditsFromTracks();
+
+    const std::wstring paletteButtonText = workingPreset_.customPaletteColours.empty()
+        ? L"Edit Palette..."
+        : L"Custom (" + std::to_wstring(workingPreset_.customPaletteColours.size()) + L")";
+    SetWindowTextW(GetDlgItem(window_, PaletteEditorButton), paletteButtonText.c_str());
+    SetWindowTextW(GetDlgItem(window_, EquationEditorButton),
+                   ToWide(EquationSummary(workingPreset_.equation)).c_str());
+
+    previewAnimation_.SetPreset(workingPreset_, settings_.general.reducedMotion);
+    previewAnimation_.SetColourCyclingEnabled(previewColourCyclingEnabled_);
+    previewAnimation_.SetMotionEnabled(zoomMotionEnabled_);
+    lastPreviewFrame_ = {previewAnimation_.Camera(), workingPreset_.colourOffset};
+    previewChangesPending_ = true;
+    if (result.requiresFullRender || result.invalidationMask != 0U) {
+        previewForceRender_ = true;
+    }
+    UpdateHistoryCommands();
+    UpdateStatus();
+}
+
+void AppWindow::UpdateHistoryCommands() {
+    HWND undo = GetDlgItem(window_, UndoButton);
+    HWND redo = GetDlgItem(window_, RedoButton);
+    if (!undo || !redo) return;
+    const std::string undoLabel = projectHistory_.UndoLabel();
+    const std::string redoLabel = projectHistory_.RedoLabel();
+    const std::wstring undoText = undoLabel.empty() ? L"Undo (Ctrl+Z)"
+        : ToWide("Undo " + undoLabel + " (Ctrl+Z)");
+    const std::wstring redoText = redoLabel.empty() ? L"Redo (Ctrl+Y)"
+        : ToWide("Redo " + redoLabel + " (Ctrl+Y)");
+    SetWindowTextW(undo, undoText.c_str());
+    SetWindowTextW(redo, redoText.c_str());
+    EnableWindow(undo, projectHistory_.CanUndo() ? TRUE : FALSE);
+    EnableWindow(redo, projectHistory_.CanRedo() ? TRUE : FALSE);
+}
+
 std::vector<Preset> AppWindow::AllPresets() const {
     auto result = builtInPresets_;
     result.insert(result.end(), settings_.customPresets.begin(), settings_.customPresets.end());
@@ -824,20 +1110,208 @@ Preset* AppWindow::FindPresetMutable(const std::string& id) {
 
 void AppWindow::UpdateCoordinatesEdit() {
     if (!coordinatesEdit_) return;
+    if (workingPreset_.exactCamera) {
+        SetControlText(coordinatesEdit_, workingPreset_.exactCamera->centreX.CanonicalText() + ", " +
+            workingPreset_.exactCamera->centreY.CanonicalText() + ", " +
+            workingPreset_.exactCamera->halfHeight.CanonicalText());
+        return;
+    }
     SetControlText(coordinatesEdit_,
         FormatDouble(CameraCentreX(workingPreset_.camera)) + ", " +
         FormatDouble(CameraCentreY(workingPreset_.camera)) + ", " +
         FormatDouble(workingPreset_.camera.scale, 12));
 }
 
-bool AppWindow::ApplyCoordinatesEdit(bool showError) {
+void AppWindow::SyncMainWindowCameraControls() {
+    if (workingPreset_.exactCamera) {
+        SetControlText(centreXEdit_, workingPreset_.exactCamera->centreX.CanonicalText());
+        SetControlText(centreYEdit_, workingPreset_.exactCamera->centreY.CanonicalText());
+        SetControlText(scaleEdit_, workingPreset_.exactCamera->halfHeight.CanonicalText());
+        SetControlText(rotationEdit_, FormatDouble(workingPreset_.rotationDegrees, 8));
+        UpdateCoordinatesEdit();
+        return;
+    }
+    SetControlText(centreXEdit_, FormatDouble(CameraCentreX(workingPreset_.camera)));
+    SetControlText(centreYEdit_, FormatDouble(CameraCentreY(workingPreset_.camera)));
+    SetControlText(scaleEdit_, FormatDouble(workingPreset_.camera.scale));
+    SetControlText(rotationEdit_, FormatDouble(workingPreset_.rotationDegrees, 8));
+    UpdateCoordinatesEdit();
+}
+
+bool AppWindow::PreviewCanRenderCamera(const CameraState& camera, bool showError) {
+    const PrecisionCapabilities rendererCapabilities = previewRenderer_.Capabilities();
+    const LegacyGpuPrecisionCapabilities capabilities{
+        rendererCapabilities.nativeFloat64,
+        rendererCapabilities.splitFloat,
+        rendererCapabilities.perturbation,
+        rendererCapabilities.arbitraryReference,
+    };
+    PrecisionMode selectedMode = settings_.performance.precision.mode;
+    std::string error;
+    if (ResolveLegacyGpuPrecision(camera, workingPreset_.equation,
+                                  settings_.performance.precision, capabilities,
+                                  selectedMode, error)) {
+        return true;
+    }
+    if (showError) {
+        MessageBoxW(window_, ToWide("The current preview renderer cannot use these coordinates. " + error).c_str(),
+                    L"Coordinates", MB_OK | MB_ICONERROR);
+    }
+    return false;
+}
+
+void AppWindow::RestartPreviewRenderer() {
+    previewRenderer_.Shutdown();
+    std::string rendererError;
+    if (previewRenderer_.Initialise(previewWindow_, rendererError)) {
+        previewRendererError_.clear();
+    } else {
+        previewRendererError_ = rendererError;
+        LogError("Preview renderer restart failed: " + rendererError);
+        InvalidateRect(previewWindow_, nullptr, TRUE);
+    }
+    previewChangeDetector_.Reset();
+    previewForceRender_ = true;
+    lastFrameTime_ = {};
+}
+
+bool AppWindow::ApplyMainWindowCameraMutation(const CameraState& camera,
+                                              CameraMutationOrigin origin,
+                                              bool refreshPreview,
+                                              const ExactCamera* exactCamera) {
+    const Preset before = workingPreset_;
+    const std::array<ParameterMutation, 5> mutations{{
+        {ParameterKey::CameraCentreXHigh, camera.centreX},
+        {ParameterKey::CameraCentreXLow, camera.centreXLow},
+        {ParameterKey::CameraCentreYHigh, camera.centreY},
+        {ParameterKey::CameraCentreYLow, camera.centreYLow},
+        {ParameterKey::CameraScale, camera.scale},
+    }};
+    ParameterMutationContext context;
+    const bool previewGesture =
+        origin == CameraMutationOrigin::PreviewPan ||
+        origin == CameraMutationOrigin::PreviewWheelZoom;
+    if (origin == CameraMutationOrigin::ScoutApply) {
+        context.origin = ParameterMutationOrigin::ScoutApply;
+    } else if (previewGesture) {
+        context.origin = ParameterMutationOrigin::UserGesture;
+        context.gestureKind = ParameterGestureKind::PreviewNavigation;
+        context.coalescingToken = previewGestureCoalescer_.ActiveToken(context.gestureKind);
+    } else {
+        previewGestureCoalescer_.Reset();
+        context.origin = ParameterMutationOrigin::UserControl;
+    }
+    ParameterMutationResult result;
+    std::string error;
+    const bool applied = exactCamera
+        ? ApplyProjectExactCameraMutation(workingPreset_, *exactCamera, result, error, context)
+        : ApplyProjectParameterMutations(workingPreset_, mutations, result, error, context);
+    if (!applied) {
+        LogError("Main-window camera mutation rejected: " + error);
+        if (previewGesture) previewAnimation_.SetManualCamera(workingPreset_.camera);
+        SyncMainWindowCameraControls();
+        return false;
+    }
+    if (origin == CameraMutationOrigin::ControlEdit ||
+        origin == CameraMutationOrigin::ScoutApply) {
+        workingPreset_.startingScale = workingPreset_.camera.scale;
+    }
+    if (origin == CameraMutationOrigin::Jump ||
+        origin == CameraMutationOrigin::ScoutApply) {
+        workingPreset_.animationMode = AnimationMode::ManualView;
+    }
+
+    std::string historyLabel = "Edit Camera";
+    switch (origin) {
+    case CameraMutationOrigin::ControlEdit: historyLabel = "Edit Camera"; break;
+    case CameraMutationOrigin::CoordinateTriplet: historyLabel = "Edit Coordinates"; break;
+    case CameraMutationOrigin::Jump: historyLabel = "Jump to Coordinates"; break;
+    case CameraMutationOrigin::ScoutApply: historyLabel = "Apply Scout Camera"; break;
+    case CameraMutationOrigin::ResetView: historyLabel = "Reset View"; break;
+    case CameraMutationOrigin::PreviewPan: historyLabel = "Pan Preview"; break;
+    case CameraMutationOrigin::PreviewWheelZoom: historyLabel = "Zoom Preview"; break;
+    }
+    (void)RecordProjectHistory(before, result, historyLabel);
+
+    SyncMainWindowCameraControls();
+    if (!refreshPreview) return true;
+
+    if (previewGesture) {
+        if (result.normalised) previewAnimation_.SetManualCamera(workingPreset_.camera);
+        if (result.changed) {
+            previewChangesPending_ = true;
+            previewForceRender_ = true;
+        }
+        return true;
+    }
+
+    previewAnimation_.SetPreset(workingPreset_, settings_.general.reducedMotion);
+    previewAnimation_.SetColourCyclingEnabled(previewColourCyclingEnabled_);
+    previewAnimation_.SetMotionEnabled(zoomMotionEnabled_);
+    previewChangesPending_ = true;
+    // Deliberate reapply actions also reset the runtime animation camera, so a
+    // render is required even when the authoritative camera values are equal.
+    previewForceRender_ = true;
+    UpdateStatus();
+    return true;
+}
+
+
+bool AppWindow::ApplyMainWindowRotationMutation(double rotationDegrees,
+                                                bool refreshPreview) {
+    previewGestureCoalescer_.Reset();
+    const Preset before = workingPreset_;
+    const std::array<ParameterMutation, 1> mutations{{
+        {ParameterKey::RotationDegrees, rotationDegrees},
+    }};
+    ParameterMutationResult result;
+    std::string error;
+    if (!ApplyProjectParameterMutations(
+            workingPreset_, mutations, result, error,
+            {ParameterMutationOrigin::UserControl,
+             ParameterGestureKind::None, 0U})) {
+        LogError("Main-window rotation mutation rejected: " + error);
+        SetControlText(rotationEdit_, FormatDouble(workingPreset_.rotationDegrees, 8));
+        return false;
+    }
+    SetControlText(rotationEdit_, FormatDouble(workingPreset_.rotationDegrees, 8));
+    (void)RecordProjectHistory(before, result, "Rotate View");
+    if (!refreshPreview || !result.changed) return true;
+
+    previewAnimation_.SetPreset(workingPreset_, settings_.general.reducedMotion);
+    previewAnimation_.SetColourCyclingEnabled(previewColourCyclingEnabled_);
+    previewAnimation_.SetMotionEnabled(zoomMotionEnabled_);
+    previewChangesPending_ = true;
+    previewForceRender_ = true;
+    UpdateStatus();
+    return true;
+}
+
+bool AppWindow::ApplyCoordinatesEdit(bool showError, bool refreshPreview) {
     if (!coordinatesEdit_) return true;
-    const std::wstring value = ToWide(ReadControlText(coordinatesEdit_));
-    double x = 0.0;
-    double y = 0.0;
-    double scale = 0.0;
-    if (!ParseCoordinateTriplet(value, x, y, scale) || !std::isfinite(x) || !std::isfinite(y) ||
-        !std::isfinite(scale) || scale <= 0.0) {
+    std::array<std::string, 3> fields;
+    std::stringstream stream(ReadControlText(coordinatesEdit_));
+    for (std::string& field : fields) {
+        if (!std::getline(stream, field, ',')) {
+            if (showError) {
+                MessageBoxW(window_, L"Use the format centreX, centreY, scale with a positive scale.",
+                            L"Coordinates", MB_OK | MB_ICONERROR);
+            }
+            UpdateCoordinatesEdit();
+            return false;
+        }
+        const auto first = field.find_first_not_of(" \\t\\r\\n");
+        const auto last = field.find_last_not_of(" \\t\\r\\n");
+        field = first == std::string::npos ? std::string{} : field.substr(first, last - first + 1U);
+    }
+    std::string trailing;
+    ExactCamera exactCamera;
+    std::string exactCameraError;
+    if (std::getline(stream, trailing, ',') ||
+        !ExactDecimal::Parse(fields[0], exactCamera.centreX, exactCameraError) ||
+        !ExactDecimal::Parse(fields[1], exactCamera.centreY, exactCameraError) ||
+        !ExactDecimal::Parse(fields[2], exactCamera.halfHeight, exactCameraError) ||
+        exactCamera.halfHeight.IsZero()) {
         if (showError) {
             MessageBoxW(window_, L"Use the format centreX, centreY, scale with a positive scale.",
                         L"Coordinates", MB_OK | MB_ICONERROR);
@@ -845,11 +1319,24 @@ bool AppWindow::ApplyCoordinatesEdit(bool showError) {
         UpdateCoordinatesEdit();
         return false;
     }
-    workingPreset_.camera = {x, y, std::clamp(scale, 1.0e-32, 4.0)};
-    SetControlText(centreXEdit_, FormatDouble(x));
-    SetControlText(centreYEdit_, FormatDouble(y));
-    SetControlText(scaleEdit_, FormatDouble(workingPreset_.camera.scale));
-    return true;
+    LegacyCameraAdaptation legacyCamera;
+    if (!AdaptExactCameraToLegacy(exactCamera, legacyCamera, exactCameraError) ||
+        legacyCamera.camera.scale <= 0.0) {
+        if (showError) {
+            MessageBoxW(window_, L"The exact coordinates cannot be represented by the current preview renderer.",
+                        L"Coordinates", MB_OK | MB_ICONERROR);
+        }
+        UpdateCoordinatesEdit();
+        return false;
+    }
+    if (!PreviewCanRenderCamera(legacyCamera.camera, showError)) {
+        UpdateCoordinatesEdit();
+        return false;
+    }
+    return ApplyMainWindowCameraMutation(legacyCamera.camera,
+                                         CameraMutationOrigin::CoordinateTriplet,
+                                         refreshPreview,
+                                         &exactCamera);
 }
 
 void AppWindow::OpenPresetLibrary(bool applyLoadedPresetToDesktop) {
@@ -867,7 +1354,7 @@ void AppWindow::OpenPresetLibrary(bool applyLoadedPresetToDesktop) {
     if (action == PresetManagerAction::Load) {
         SendMessageW(presetCombo_, CB_SETCURSEL, selectedIndex, 0);
         LoadSelectedPreset();
-        if (applyLoadedPresetToDesktop) SetWallpaper();
+        if (applyLoadedPresetToDesktop) SetStaticWallpaper();
     } else if (action == PresetManagerAction::SaveNew) {
         SaveAsNewPreset(saveAsName);
     } else if (action == PresetManagerAction::Update) {
@@ -876,16 +1363,30 @@ void AppWindow::OpenPresetLibrary(bool applyLoadedPresetToDesktop) {
                         L"Preset Library", MB_OK | MB_ICONINFORMATION);
             return;
         }
+        const Preset& target = presets[static_cast<std::size_t>(selectedIndex)];
+        const std::wstring confirmation = L"Replace the saved custom preset \"" +
+            ToWide(target.name) + L"\" with the current preview?";
+        if (MessageBoxW(window_, confirmation.c_str(), L"Update Custom Preset",
+                        MB_YESNO | MB_DEFBUTTON2 | MB_ICONWARNING) != IDYES) return;
         ApplyControlsToWorkingPreset();
         Preset updated = workingPreset_;
-        updated.id = presets[static_cast<std::size_t>(selectedIndex)].id;
-        updated.name = presets[static_cast<std::size_t>(selectedIndex)].name;
+        updated.id = target.id;
+        updated.name = target.name;
         updated.builtIn = false;
-        if (Preset* stored = FindPresetMutable(updated.id)) *stored = updated;
+        Preset* stored = FindPresetMutable(updated.id);
+        if (!stored) return;
+        const Preset previous = *stored;
+        *stored = updated;
         settings_.selectedPresetId = updated.id;
+        std::string saveError;
+        if (!SaveSettings(&saveError)) {
+            *stored = previous;
+            MessageBoxW(window_, ToWide("The preset could not be updated. " + saveError).c_str(),
+                        L"Update Custom Preset", MB_OK | MB_ICONERROR);
+            return;
+        }
         PopulatePresetCombo();
         LoadSelectedPreset();
-        SaveSettings();
     } else if (action == PresetManagerAction::Delete) {
         SendMessageW(presetCombo_, CB_SETCURSEL, selectedIndex, 0);
         LoadSelectedPreset();
@@ -901,20 +1402,46 @@ void AppWindow::OpenPresetLibrary(bool applyLoadedPresetToDesktop) {
     }
 }
 
-void AppWindow::LoadSelectedPreset() {
+bool AppWindow::ApplyWorkingPresetReplacement(
+    Preset candidate,
+    ProjectPresetReplacementContext context,
+    ProjectPresetReplacementResult* resultOut) {
+    previewGestureCoalescer_.Reset();
+    const Preset before = workingPreset_;
+    ProjectPresetReplacementResult result;
+    std::string error;
+    if (!ApplyProjectPresetReplacement(
+            workingPreset_, std::move(candidate), result, error, context)) {
+        LogError("Working-preset replacement rejected: " + error);
+        return false;
+    }
+    if (result.changed) {
+        std::string historyError;
+        if (!projectHistory_.RecordPresetReplacement(
+                before, workingPreset_, result, {}, historyError)) {
+            LogWarning("Project replacement history entry was not recorded: " + historyError);
+        }
+        UpdateHistoryCommands();
+    }
+    if (resultOut) *resultOut = result;
+    return true;
+}
+
+void AppWindow::LoadSelectedPreset(ProjectPresetReplacementContext context) {
     const auto presets = AllPresets();
     const int index = SelectedComboIndex(presetCombo_);
     if (index < 0 || index >= static_cast<int>(presets.size())) return;
-    workingPreset_ = presets[static_cast<std::size_t>(index)];
+    if (!ApplyWorkingPresetReplacement(
+            presets[static_cast<std::size_t>(index)], context)) return;
     settings_.selectedPresetId = workingPreset_.id;
     SetControlText(presetNameEdit_, workingPreset_.name);
     SetControlText(centreXEdit_, FormatDouble(CameraCentreX(workingPreset_.camera)));
     SetControlText(centreYEdit_, FormatDouble(CameraCentreY(workingPreset_.camera)));
     SetControlText(scaleEdit_, FormatDouble(workingPreset_.camera.scale));
+    SetControlText(rotationEdit_, FormatDouble(workingPreset_.rotationDegrees, 8));
     UpdateCoordinatesEdit();
     SetWindowTextW(presetLibraryButton_, ToWide("Preset: " + workingPreset_.name + "...").c_str());
     SendMessageW(paletteCombo_, CB_SETCURSEL, static_cast<WPARAM>(workingPreset_.palette), 0);
-    SendMessageW(animationCombo_, CB_SETCURSEL, static_cast<WPARAM>(workingPreset_.animationMode), 0);
     SendMessageW(iterationsTrack_, TBM_SETPOS, TRUE, workingPreset_.maximumIterations);
     SendMessageW(fpsTrack_, TBM_SETPOS, TRUE, settings_.performance.maximumFrameRate);
     SendMessageW(renderScaleTrack_, TBM_SETPOS, TRUE, static_cast<LPARAM>(std::lround(settings_.performance.renderScale * 100.0)));
@@ -935,32 +1462,48 @@ void AppWindow::LoadSelectedPreset() {
     SetWindowTextW(GetDlgItem(window_, PaletteEditorButton), paletteButtonText.c_str());
     SetWindowTextW(GetDlgItem(window_, EquationEditorButton), ToWide(EquationSummary(workingPreset_.equation)).c_str());
     previewChangesPending_ = wallpaperController_.IsRunning();
-    LoadMonitorAssignmentSelection();
     UpdateStatus();
 }
 
 void AppWindow::ApplyControlsToWorkingPreset() {
-    ApplyCoordinatesEdit(false);
+    ApplyCoordinatesEdit(false, false);
     workingPreset_.name = ReadControlText(presetNameEdit_);
-    try { workingPreset_.camera.centreX = std::stod(ReadControlText(centreXEdit_)); workingPreset_.camera.centreXLow = 0.0; } catch (...) {}
-    try { workingPreset_.camera.centreY = std::stod(ReadControlText(centreYEdit_)); workingPreset_.camera.centreYLow = 0.0; } catch (...) {}
-    try { workingPreset_.camera.scale = std::stod(ReadControlText(scaleEdit_)); } catch (...) {}
-    workingPreset_.startingScale = workingPreset_.camera.scale;
-    const int palette = SelectedComboIndex(paletteCombo_);
-    const int animation = SelectedComboIndex(animationCombo_);
-    if (palette >= 0 && palette <= static_cast<int>(Palette::HighContrast)) {
-        const auto selectedPalette = static_cast<Palette>(palette);
-        if (selectedPalette != workingPreset_.palette) workingPreset_.customPaletteColours.clear();
-        workingPreset_.palette = selectedPalette;
+    ExactCamera exactCamera;
+    std::string exactCameraError;
+    if (!ExactDecimal::Parse(ReadControlText(centreXEdit_), exactCamera.centreX, exactCameraError) ||
+        !ExactDecimal::Parse(ReadControlText(centreYEdit_), exactCamera.centreY, exactCameraError) ||
+        !ExactDecimal::Parse(ReadControlText(scaleEdit_), exactCamera.halfHeight, exactCameraError)) {
+        LogError("Main-window exact camera text rejected: " + exactCameraError);
+        SyncMainWindowCameraControls();
+    } else {
+        LegacyCameraAdaptation legacyCamera;
+        if (!AdaptExactCameraToLegacy(exactCamera, legacyCamera, exactCameraError)) {
+            LogError("Main-window exact camera cannot be adapted for the current renderer: " +
+                     exactCameraError);
+            SyncMainWindowCameraControls();
+        } else {
+            if (!PreviewCanRenderCamera(legacyCamera.camera, false)) {
+                LogError("Main-window exact camera is unavailable in the selected preview precision mode.");
+                SyncMainWindowCameraControls();
+            } else {
+                (void)ApplyMainWindowCameraMutation(legacyCamera.camera,
+                                                    CameraMutationOrigin::ControlEdit,
+                                                    false,
+                                                    &exactCamera);
+            }
+        }
     }
-    if (animation >= 0 && animation <= static_cast<int>(AnimationMode::ManualView)) workingPreset_.animationMode = static_cast<AnimationMode>(animation);
+    try {
+        (void)ApplyMainWindowRotationMutation(
+            std::stod(ReadControlText(rotationEdit_)), false);
+    } catch (...) {
+        SetControlText(rotationEdit_, FormatDouble(workingPreset_.rotationDegrees, 8));
+    }
+    (void)ApplyMainWindowPaletteSelection(false);
     workingPreset_.maximumIterations = static_cast<int>(SendMessageW(iterationsTrack_, TBM_GETPOS, 0, 0));
     workingPreset_.zoomSpeed = static_cast<double>(SendMessageW(zoomSpeedTrack_, TBM_GETPOS, 0, 0)) / 100.0;
     workingPreset_.colourCycleSpeed = static_cast<double>(SendMessageW(colourSpeedTrack_, TBM_GETPOS, 0, 0)) / 100.0;
-    workingPreset_.brightness = static_cast<double>(SendMessageW(brightnessTrack_, TBM_GETPOS, 0, 0)) / 100.0;
-    workingPreset_.contrast = static_cast<double>(SendMessageW(contrastTrack_, TBM_GETPOS, 0, 0)) / 100.0;
-    workingPreset_.saturation = static_cast<double>(SendMessageW(saturationTrack_, TBM_GETPOS, 0, 0)) / 100.0;
-    workingPreset_.colourOffset = (static_cast<double>(SendMessageW(colourOffsetTrack_, TBM_GETPOS, 0, 0)) - 100.0) / 100.0;
+    (void)ApplyMainWindowPalettePostControls(false);
     settings_.performance.maximumFrameRate = static_cast<int>(SendMessageW(fpsTrack_, TBM_GETPOS, 0, 0));
     settings_.performance.renderScale = static_cast<double>(SendMessageW(renderScaleTrack_, TBM_GETPOS, 0, 0)) / 100.0;
     settings_.performance.maximumIterations = workingPreset_.maximumIterations;
@@ -978,7 +1521,6 @@ void AppWindow::ApplyControlsToWorkingPreset() {
     SyncNumericEditsFromTracks();
     UpdateCoordinatesEdit();
     previewChangesPending_ = true;
-    UpdateMonitorAssignmentControls();
 }
 
 void AppWindow::ApplyPerformanceProfile() {
@@ -1014,15 +1556,31 @@ bool AppWindow::SaveSettings(std::string* errorOut) {
     return true;
 }
 
-void AppWindow::SetWallpaper() {
-    ApplyControlsToWorkingPreset();
+void AppWindow::SelectVideoWallpaper() {
+    const std::wstring selected = OpenVideoWallpaperDialog(window_);
+    if (selected.empty()) return;
+    settings_.videoWallpaper.filePath = ToUtf8(selected);
+    StartSavedVideoWallpaper();
+}
+
+void AppWindow::StartSavedVideoWallpaper() {
+    if (settings_.videoWallpaper.filePath.empty()) {
+        SelectVideoWallpaper();
+        return;
+    }
     std::string error;
-    AppSettings runtimeSettings = settings_;
-    runtimeSettings.general.colourCyclingEnabled = desktopColourCyclingEnabled_;
-    if (!wallpaperController_.Start(instance_, runtimeSettings, AllPresets(), error)) {
-        MessageBoxW(window_, L"The wallpaper could not be attached behind the desktop icons. Restart Windows Explorer or reopen the application.",
-                    L"Desktop Attachment Failure", MB_ICONERROR | MB_OK);
-        LogError("Wallpaper start failed: " + error);
+    const std::filesystem::path path(ToWide(settings_.videoWallpaper.filePath));
+    if (!wallpaperController_.StartVideo(instance_, settings_, AllPresets(), path, error)) {
+        MessageBoxW(window_, ToWide("The exported video could not be used as the desktop background. " + error).c_str(),
+                    L"Video Wallpaper", MB_ICONERROR | MB_OK);
+        LogError("Video wallpaper start failed: " + error);
+        if (settings_.general.defaultDesktopMode == DesktopMode::Video) {
+            settings_.general.defaultDesktopMode = DesktopMode::None;
+        }
+        currentDesktopMode_ = DesktopMode::None;
+        SendMessageW(desktopModeCombo_, CB_SETCURSEL, 0, 0);
+        UpdateDesktopModeControls();
+        SaveSettings();
         return;
     }
     userPaused_ = false;
@@ -1030,11 +1588,11 @@ void AppWindow::SetWallpaper() {
     adaptivePaused_ = false;
     adaptivePerformanceController_.Reset();
     previewForceRender_ = true;
-    settings_.staticWallpaper.enabled = false;
     settings_.lastWallpaperRunning = true;
     previewChangesPending_ = false;
-    wallpaperController_.SetMotionEnabled(desktopZoomMotionEnabled_);
-    wallpaperController_.SetColourCyclingEnabled(desktopColourCyclingEnabled_);
+    currentDesktopMode_ = DesktopMode::Video;
+    SendMessageW(desktopModeCombo_, CB_SETCURSEL, static_cast<WPARAM>(currentDesktopMode_), 0);
+    UpdateDesktopModeControls();
     SaveSettings();
     UpdateStatus();
 }
@@ -1044,7 +1602,14 @@ void AppWindow::StartSavedStaticWallpaper() {
     if (!wallpaperController_.StartStaticGallery(instance_, settings_, AllPresets(), error)) {
         settings_.staticWallpaper.enabled = false;
         LogWarning("Saved static wallpaper start failed: " + error);
-        SetWallpaper();
+        wallpaperController_.Stop();
+        settings_.lastWallpaperRunning = false;
+        currentDesktopMode_ = DesktopMode::None;
+        SendMessageW(desktopModeCombo_, CB_SETCURSEL, 0, 0);
+        MessageBoxW(window_, ToWide("No saved image could be used as the desktop background. " + error).c_str(),
+                    L"Static Wallpaper", MB_OK | MB_ICONERROR);
+        SaveSettings();
+        UpdateStatus();
         return;
     }
     userPaused_ = false;
@@ -1054,11 +1619,15 @@ void AppWindow::StartSavedStaticWallpaper() {
     previewForceRender_ = true;
     settings_.lastWallpaperRunning = true;
     previewChangesPending_ = false;
+    currentDesktopMode_ = settings_.staticWallpaper.cycleEnabled ? DesktopMode::Slideshow : DesktopMode::StaticImage;
+    SendMessageW(desktopModeCombo_, CB_SETCURSEL, static_cast<WPARAM>(currentDesktopMode_), 0);
+    UpdateDesktopModeControls();
     SaveSettings();
     UpdateStatus();
 }
 
 void AppWindow::SetStaticWallpaper() {
+    settings_.staticWallpaper.cycleEnabled = false;
     if (settings_.staticWallpaper.imagePaths.size() >= 512U) {
         MessageBoxW(window_, L"The slideshow list already contains the 512-image safety maximum. Remove an image before capturing another.",
                     L"Static Slideshow", MB_OK | MB_ICONINFORMATION);
@@ -1088,6 +1657,9 @@ void AppWindow::SetStaticWallpaper() {
     previewForceRender_ = true;
     wallpaperController_.UpdateConfiguration(settings_, AllPresets());
     previewChangesPending_ = false;
+    currentDesktopMode_ = DesktopMode::StaticImage;
+    SendMessageW(desktopModeCombo_, CB_SETCURSEL, static_cast<WPARAM>(currentDesktopMode_), 0);
+    UpdateDesktopModeControls();
     SaveSettings();
     UpdateStatus();
 }
@@ -1103,6 +1675,13 @@ Preset AppWindow::CurrentPreviewSnapshot() {
     snapshot.camera = currentFrame.camera;
     snapshot.startingScale = currentFrame.camera.scale;
     snapshot.colourOffset = currentFrame.colourOffset;
+    if (snapshot.camera != workingPreset_.camera) {
+        snapshot.exactCamera.reset();
+        std::string exactCameraError;
+        if (!EnsureExactCamera(snapshot, exactCameraError)) {
+            LogError("Preview snapshot exact-camera reconstruction failed: " + exactCameraError);
+        }
+    }
     ValidateAndNormalise(snapshot);
     return snapshot;
 }
@@ -1123,6 +1702,7 @@ void AppWindow::AddPreviewToSlideshow() {
     }
     const bool wasRunning = wallpaperController_.IsRunning();
     const bool wasStatic = wallpaperController_.UsingUserStatic();
+    const bool wasVideo = wallpaperController_.UsingVideo();
     const bool wasUserPaused = userPaused_;
     const Preset snapshot = CurrentPreviewSnapshot();
 
@@ -1146,26 +1726,11 @@ void AppWindow::AddPreviewToSlideshow() {
         wallpaperController_.UpdateConfiguration(settings_, AllPresets());
         if (wasUserPaused) {
             std::string pauseError;
-            wallpaperController_.PauseAndReleaseGpu("Paused by user", pauseError);
+            wallpaperController_.PausePresentation("Paused by user", pauseError);
         }
-    } else if (wasRunning) {
-        settings_.staticWallpaper.enabled = false;
-        std::string restoreError;
-        AppSettings runtimeSettings = settings_;
-        runtimeSettings.general.colourCyclingEnabled = desktopColourCyclingEnabled_;
-        if (!wallpaperController_.Start(instance_, runtimeSettings, AllPresets(), restoreError)) {
-            LogError("Live wallpaper restore after slideshow capture failed: " + restoreError);
-            settings_.staticWallpaper.enabled = true;
-            std::string staticError;
-            wallpaperController_.StartStaticGallery(instance_, settings_, AllPresets(), staticError);
-        } else {
-            wallpaperController_.SetMotionEnabled(desktopZoomMotionEnabled_);
-            wallpaperController_.SetColourCyclingEnabled(desktopColourCyclingEnabled_);
-            if (wasUserPaused) {
-                std::string pauseError;
-                wallpaperController_.PauseAndReleaseGpu("Paused by user", pauseError);
-            }
-        }
+    } else if (wasRunning && wasVideo) {
+        StartSavedVideoWallpaper();
+        if (wasUserPaused) wallpaperController_.Pause("Paused by user");
     } else {
         wallpaperController_.Stop();
         settings_.staticWallpaper.enabled = false;
@@ -1194,6 +1759,9 @@ void AppWindow::ManageSlideshow() {
         }
         settings_.staticWallpaper.enabled = true;
         StartSavedStaticWallpaper();
+        currentDesktopMode_ = settings_.staticWallpaper.cycleEnabled
+            ? DesktopMode::Slideshow : DesktopMode::StaticImage;
+        UpdateDesktopModeControls();
     } else {
         SaveSettings();
         UpdateStatus();
@@ -1202,7 +1770,49 @@ void AppWindow::ManageSlideshow() {
 
 void AppWindow::OpenPaletteEditor() {
     ApplyControlsToWorkingPreset();
-    if (!PaletteEditorDialog::Show(window_, instance_, workingPreset_, settings_.customPalettePresets)) return;
+    previewGestureCoalescer_.Reset();
+    Preset editedPreset = workingPreset_;
+    auto editedPalettePresets = settings_.customPalettePresets;
+    auto applyPreview = [this, &editedPreset]() {
+        dialogPreviewPreset_ = MergePaletteEditorCandidate(workingPreset_, editedPreset);
+        previewAnimation_.SetPreset(*dialogPreviewPreset_, settings_.general.reducedMotion);
+        previewAnimation_.SetColourCyclingEnabled(previewColourCyclingEnabled_);
+        previewAnimation_.SetMotionEnabled(zoomMotionEnabled_);
+        previewChangesPending_ = true;
+        previewForceRender_ = true;
+        const std::wstring text = editedPreset.customPaletteColours.empty()
+            ? L"Edit Palette..."
+            : L"Custom (" + std::to_wstring(editedPreset.customPaletteColours.size()) + L")";
+        SetWindowTextW(GetDlgItem(window_, PaletteEditorButton), text.c_str());
+    };
+    if (!PaletteEditorDialog::Show(
+            window_, instance_, editedPreset, editedPalettePresets, applyPreview)) {
+        dialogPreviewPreset_.reset();
+        previewAnimation_.SetPreset(workingPreset_, settings_.general.reducedMotion);
+        previewAnimation_.SetColourCyclingEnabled(previewColourCyclingEnabled_);
+        previewAnimation_.SetMotionEnabled(zoomMotionEnabled_);
+        previewChangesPending_ = true;
+        previewForceRender_ = true;
+        const std::wstring text = workingPreset_.customPaletteColours.empty()
+            ? L"Edit Palette..."
+            : L"Custom (" + std::to_wstring(workingPreset_.customPaletteColours.size()) + L")";
+        SetWindowTextW(GetDlgItem(window_, PaletteEditorButton), text.c_str());
+        return;
+    }
+    dialogPreviewPreset_.reset();
+    editedPreset = MergePaletteEditorCandidate(workingPreset_, editedPreset);
+    if (!ApplyWorkingPresetReplacement(
+            std::move(editedPreset),
+            {ParameterMutationOrigin::UserControl,
+             ProjectPresetReplacementKind::PaletteDialog})) {
+        previewAnimation_.SetPreset(workingPreset_, settings_.general.reducedMotion);
+        previewAnimation_.SetColourCyclingEnabled(previewColourCyclingEnabled_);
+        previewAnimation_.SetMotionEnabled(zoomMotionEnabled_);
+        previewChangesPending_ = true;
+        previewForceRender_ = true;
+        return;
+    }
+    settings_.customPalettePresets = std::move(editedPalettePresets);
     if (!workingPreset_.builtIn) {
         if (Preset* stored = FindPresetMutable(workingPreset_.id)) *stored = workingPreset_;
     }
@@ -1210,6 +1820,7 @@ void AppWindow::OpenPaletteEditor() {
     previewAnimation_.SetColourCyclingEnabled(previewColourCyclingEnabled_);
     previewAnimation_.SetMotionEnabled(zoomMotionEnabled_);
     previewChangesPending_ = true;
+    previewForceRender_ = true;
     const std::wstring text = workingPreset_.customPaletteColours.empty()
         ? L"Edit Palette..."
         : L"Custom (" + std::to_wstring(workingPreset_.customPaletteColours.size()) + L")";
@@ -1219,10 +1830,31 @@ void AppWindow::OpenPaletteEditor() {
 
 void AppWindow::OpenEquationEditor() {
     ApplyControlsToWorkingPreset();
+    previewGestureCoalescer_.Reset();
+    Preset editedPreset = workingPreset_;
+    auto editedEquationPresets = settings_.customEquationPresets;
+    auto applyPreview = [this, &editedPreset]() {
+        dialogPreviewPreset_ = MergeEquationEditorCandidate(workingPreset_, editedPreset);
+        previewAnimation_.SetPreset(*dialogPreviewPreset_, settings_.general.reducedMotion);
+        previewAnimation_.SetColourCyclingEnabled(previewColourCyclingEnabled_);
+        previewAnimation_.SetMotionEnabled(zoomMotionEnabled_);
+        previewChangesPending_ = true;
+        previewForceRender_ = true;
+    };
     const bool accepted = EquationEditorDialog::Show(
-        window_, instance_, workingPreset_, settings_.customEquationPresets);
-    SaveSettings();
-    if (!accepted) return;
+        window_, instance_, editedPreset, editedEquationPresets, applyPreview);
+    dialogPreviewPreset_.reset();
+    if (!accepted) {
+        previewAnimation_.SetPreset(workingPreset_, settings_.general.reducedMotion);
+        previewForceRender_ = true;
+        return;
+    }
+    settings_.customEquationPresets = std::move(editedEquationPresets);
+    editedPreset = MergeEquationEditorCandidate(workingPreset_, editedPreset);
+    if (!ApplyWorkingPresetReplacement(
+            std::move(editedPreset),
+            {ParameterMutationOrigin::UserControl,
+             ProjectPresetReplacementKind::EquationDialog})) return;
     if (!workingPreset_.builtIn) {
         if (Preset* stored = FindPresetMutable(workingPreset_.id)) *stored = workingPreset_;
     }
@@ -1237,7 +1869,7 @@ void AppWindow::OpenEquationEditor() {
 }
 
 void AppWindow::TogglePause() {
-    if (!wallpaperController_.IsRunning()) return;
+    if (!wallpaperController_.IsRunning() || exportDialogOpen_) return;
     if (wallpaperController_.IsPaused()) {
         if (adaptivePaused_) {
             MessageBoxW(window_, L"Rendering is paused by adaptive resource protection. It will resume after CPU and memory remain stable for the configured cooldown.",
@@ -1247,17 +1879,12 @@ void AppWindow::TogglePause() {
         autoPaused_ = false;
         wallpaperController_.Resume();
         userPaused_ = wallpaperController_.IsPaused();
-        if (userPaused_ && !wallpaperController_.LastRendererError().empty()) {
-            MessageBoxW(window_, ToWide("The live renderer could not resume. The captured paused frame remains active. " +
-                                       wallpaperController_.LastRendererError()).c_str(),
-                        L"Resume Wallpaper", MB_OK | MB_ICONERROR);
-        }
         previewForceRender_ = true;
     } else {
         userPaused_ = true;
         std::string pauseError;
-        if (!wallpaperController_.PauseAndReleaseGpu("Paused by user", pauseError) && !pauseError.empty()) {
-            LogWarning("Paused without releasing the wallpaper GPU: " + pauseError);
+        if (!wallpaperController_.PausePresentation("Paused by user", pauseError) && !pauseError.empty()) {
+            LogWarning("Desktop presentation could not be paused: " + pauseError);
         }
     }
     UpdateStatus();
@@ -1266,11 +1893,9 @@ void AppWindow::TogglePause() {
 void AppWindow::ToggleColourCycling() {
     const bool enabled = !previewColourCyclingEnabled_;
     previewColourCyclingEnabled_ = enabled;
-    desktopColourCyclingEnabled_ = enabled;
     settings_.general.colourCyclingEnabled = enabled;
     previewAnimation_.SetColourCyclingEnabled(previewColourCyclingEnabled_);
     previewAnimation_.SetMotionEnabled(zoomMotionEnabled_);
-    wallpaperController_.SetColourCyclingEnabled(desktopColourCyclingEnabled_);
     previewForceRender_ = true;
     SaveSettings();
     UpdateStatus();
@@ -1295,6 +1920,9 @@ void AppWindow::StopWallpaper() {
     autoPaused_ = false;
     adaptivePaused_ = false;
     adaptivePerformanceController_.Reset();
+    currentDesktopMode_ = DesktopMode::None;
+    SendMessageW(desktopModeCombo_, CB_SETCURSEL, static_cast<WPARAM>(currentDesktopMode_), 0);
+    UpdateDesktopModeControls();
     SaveSettings();
     UpdateStatus();
 }
@@ -1302,8 +1930,6 @@ void AppWindow::StopWallpaper() {
 void AppWindow::PollSystemState() {
     const auto state = systemStateMonitor_.Poll();
     const auto systemDecision = systemStateMonitor_.Evaluate(settings_.performance);
-    const bool reducedBatteryQuality = state.onBattery && settings_.performance.reduceQualityOnBattery;
-    wallpaperController_.SetBatteryQualityReduction(reducedBatteryQuality);
 
     const auto now = std::chrono::steady_clock::now();
     const double adaptiveElapsed = std::clamp(
@@ -1324,14 +1950,7 @@ void AppWindow::PollSystemState() {
     if (previewActive && previewRenderer_.FramesPerSecond() > 0.0) {
         activeFps.push_back(previewRenderer_.FramesPerSecond());
     }
-    const bool wallpaperActive = wallpaperController_.IsRunning() && !wallpaperController_.IsPaused() &&
-                                 !wallpaperController_.UsingUserStatic() &&
-                                 !wallpaperController_.UsingStaticFallback() &&
-                                 !wallpaperController_.IsVisuallyIdle();
-    if (wallpaperActive && wallpaperController_.FramesPerSecond() > 0.0) {
-        activeFps.push_back(wallpaperController_.FramesPerSecond());
-    }
-    sample.rendererActive = previewActive || wallpaperActive;
+    sample.rendererActive = previewActive;
     sample.framesPerSecondMeaningful = !activeFps.empty();
     if (!activeFps.empty()) sample.framesPerSecond = *std::min_element(activeFps.begin(), activeFps.end());
 
@@ -1342,14 +1961,14 @@ void AppWindow::PollSystemState() {
     const bool shouldAutoPause = systemDecision.shouldPause || adaptivePaused_;
     const std::string autoPauseReason = systemDecision.shouldPause ? systemDecision.reason : adaptiveDecision.reason;
     if (shouldAutoPause && wallpaperController_.IsRunning() && !userPaused_) {
-        if (!autoPaused_ || wallpaperController_.PauseReason() != autoPauseReason) {
+        if (!autoPaused_ || (!exportDialogOpen_ && wallpaperController_.PauseReason() != autoPauseReason)) {
             autoPaused_ = true;
-            wallpaperController_.Pause(autoPauseReason);
+            if (!exportDialogOpen_) wallpaperController_.Pause(autoPauseReason);
             autoResumeEligibleAt_ = now + std::chrono::milliseconds(settings_.performance.resumeDelayMs);
         }
     } else if (!shouldAutoPause && autoPaused_ && !userPaused_ && now >= autoResumeEligibleAt_) {
         autoPaused_ = false;
-        wallpaperController_.Resume();
+        if (!exportDialogOpen_) wallpaperController_.Resume();
         previewForceRender_ = true;
     }
 }
@@ -1361,15 +1980,34 @@ void AppWindow::RenderTick() {
         lastSystemPoll_ = now;
     }
 
-    int frameLimit = settings_.performance.maximumFrameRate;
+    const AppSettings& renderSettings = dialogPreviewSettings_.value_or(settings_);
+    int frameLimit = renderSettings.performance.maximumFrameRate;
     const auto state = systemStateMonitor_.State();
-    if (state.onBattery && settings_.performance.reduceQualityOnBattery) frameLimit = std::min(frameLimit, 15);
+    if (state.onBattery && renderSettings.performance.reduceQualityOnBattery) frameLimit = std::min(frameLimit, 15);
     const double minimumFrameSeconds = 1.0 / std::max(5, frameLimit);
     const double elapsed = std::chrono::duration<double>(now - lastFrameTime_).count();
     if (elapsed < minimumFrameSeconds) return;
     lastFrameTime_ = now;
 
+    const DesktopMode tickDesktopMode = currentDesktopMode_;
     wallpaperController_.Tick(elapsed);
+    if (const auto runtimeError = wallpaperController_.TakeRuntimeError()) {
+        settings_.lastWallpaperRunning = false;
+        if (tickDesktopMode == DesktopMode::StaticImage || tickDesktopMode == DesktopMode::Slideshow) {
+            settings_.staticWallpaper.enabled = false;
+        }
+        if (settings_.general.defaultDesktopMode == tickDesktopMode) {
+            settings_.general.defaultDesktopMode = DesktopMode::None;
+        }
+        currentDesktopMode_ = DesktopMode::None;
+        SendMessageW(desktopModeCombo_, CB_SETCURSEL, 0, 0);
+        UpdateDesktopModeControls();
+        SaveSettings();
+        UpdateStatus();
+        UpdateQuickController();
+        MessageBoxW(window_, ToWide(*runtimeError).c_str(), L"Desktop Background Stopped",
+                    MB_OK | MB_ICONERROR);
+    }
     if (adaptivePaused_) {
         UpdateStatus();
         return;
@@ -1381,45 +2019,66 @@ void AppWindow::RenderTick() {
         return;
     }
 
-    const auto frame = previewAnimation_.Update(elapsed);
+    Preset renderPreset = dialogPreviewPreset_.value_or(workingPreset_);
+    AnimationFrame frame;
+    if (generalAnimationPreviewActive_) {
+        AnimationEvaluationResult evaluation;
+        std::string evaluationError;
+        if (EvaluateGeneralAnimation(workingPreset_, generalAnimationPreviewTimeline_,
+                                     generalAnimationClocks_.Time(AnimationClockDomain::Preview),
+                                     0U, evaluation, evaluationError)) {
+            renderPreset = std::move(evaluation.framePreset);
+            frame = {renderPreset.camera, renderPreset.colourOffset};
+        } else {
+            generalAnimationPreviewActive_ = false;
+            LogWarning("General animation preview stopped: " + evaluationError);
+            frame = previewAnimation_.Update(elapsed);
+        }
+    } else {
+        frame = previewAnimation_.Update(elapsed);
+    }
     lastPreviewFrame_ = frame;
     RECT client{};
     GetClientRect(previewWindow_, &client);
     RenderRegion region;
     region.pixels = client;
     region.camera = frame.camera;
-    region.palette = workingPreset_.palette;
-    region.customPaletteColours = workingPreset_.customPaletteColours;
-    region.equation = workingPreset_.equation;
-    region.maximumIterations = (state.onBattery && settings_.performance.reduceQualityOnBattery)
-        ? std::max(64, static_cast<int>(std::lround(workingPreset_.maximumIterations * 0.6)))
-        : workingPreset_.maximumIterations;
+    region.rotationDegrees = renderPreset.rotationDegrees;
+    region.palette = renderPreset.palette;
+    region.customPaletteColours = renderPreset.customPaletteColours;
+    region.equation = renderPreset.equation;
+    region.maximumIterations = (state.onBattery && renderSettings.performance.reduceQualityOnBattery)
+        ? std::max(64, static_cast<int>(std::lround(renderPreset.maximumIterations * 0.6)))
+        : renderPreset.maximumIterations;
     region.colourOffset = frame.colourOffset;
-    region.brightness = workingPreset_.brightness;
-    region.contrast = workingPreset_.contrast;
-    region.saturation = workingPreset_.saturation;
-    region.interiorColour = workingPreset_.interiorColour;
-    region.backgroundColour = workingPreset_.backgroundColour;
-    region.smoothColouring = workingPreset_.smoothColouring;
+    region.paletteFrequency = renderPreset.paletteFrequency;
+    region.paletteGamma = renderPreset.paletteGamma;
+    region.paletteInterpolation = renderPreset.paletteInterpolation;
+    region.brightness = renderPreset.brightness;
+    region.contrast = renderPreset.contrast;
+    region.saturation = renderPreset.saturation;
+    region.interiorColour = renderPreset.interiorColour;
+    region.backgroundColour = renderPreset.backgroundColour;
+    region.smoothColouring = renderPreset.smoothColouring;
 
     RenderOptions options;
-    options.renderScale = (state.onBattery && settings_.performance.reduceQualityOnBattery)
-        ? settings_.performance.renderScale * 0.66 : settings_.performance.renderScale;
-    options.antiAliasingLevel = (state.onBattery && settings_.performance.reduceQualityOnBattery)
-        ? 1 : settings_.performance.antiAliasingLevel;
-    options.precision = settings_.performance.precision;
+    options.renderScale = (state.onBattery && renderSettings.performance.reduceQualityOnBattery)
+        ? renderSettings.performance.renderScale * 0.66 : renderSettings.performance.renderScale;
+    options.antiAliasingLevel = (state.onBattery && renderSettings.performance.reduceQualityOnBattery)
+        ? 1 : renderSettings.performance.antiAliasingLevel;
+    options.precision = renderSettings.performance.precision;
 
     VisualFrameDescriptor descriptor;
     descriptor.camera = region.camera;
     descriptor.colourOffset = region.colourOffset;
     descriptor.pixelWidth = static_cast<int>(std::max<LONG>(1L, client.right - client.left));
     descriptor.pixelHeight = static_cast<int>(std::max<LONG>(1L, client.bottom - client.top));
-    descriptor.contentRevision = ComputeVisualRevision(workingPreset_, region.maximumIterations,
+    descriptor.contentRevision = ComputeVisualRevision(renderPreset, region.maximumIterations,
                                                        options.renderScale, options.antiAliasingLevel,
                                                        options.precision);
     const bool shouldRenderPreview = previewChangeDetector_.ShouldRender(
-        {descriptor}, settings_.performance.adaptive,
-        previewForceRender_ || workingPreset_.equation.animateCoefficients);
+        {descriptor}, renderSettings.performance.adaptive,
+        previewForceRender_ || renderPreset.equation.animateCoefficients);
     previewForceRender_ = false;
 
     std::string error;
@@ -1443,14 +2102,13 @@ void AppWindow::UpdateStatus() {
     if (!wallpaperController_.IsRunning()) status << "Status: stopped";
     else if (wallpaperController_.IsPaused()) {
         status << "Status: paused — " << wallpaperController_.PauseReason();
-        if (wallpaperController_.UsingPausedSnapshot()) status << " (captured frame, GPU released)";
     }
-    else if (wallpaperController_.UsingUserStatic()) status << "Status: running — saved static image (GPU idle)";
-    else if (wallpaperController_.UsingStaticFallback()) status << "Status: running — static CPU fallback (GPU unavailable)";
-    else status << "Status: running";
+    else if (wallpaperController_.UsingUserStatic()) status << "Status: running — saved image/slideshow (file-backed)";
+    else if (wallpaperController_.UsingVideo()) status << "Status: running — exported video (file-backed)";
+    else status << "Status: stopped";
     if (adaptivePaused_) status << " | preview paused by resource protection";
     else if (previewChangeDetector_.IsVisuallyIdle()) status << " | preview equation idle until a visible change";
-    if (previewChangesPending_) status << " | preview changes not yet applied to wallpaper";
+    if (previewChangesPending_) status << " | preview differs from saved image backgrounds";
     SetControlText(statusLabel_, status.str());
 
     std::ostringstream fps;
@@ -1459,7 +2117,6 @@ void AppWindow::UpdateStatus() {
         ? 0.0 : previewRenderer_.FramesPerSecond();
     const auto systemState = systemStateMonitor_.State();
     fps << std::fixed << std::setprecision(1) << "Preview FPS: " << previewFps
-        << " | Wallpaper FPS: " << wallpaperController_.FramesPerSecond()
         << " | CPU: " << systemState.processCpuPercent << "%"
         << " | Memory: " << static_cast<double>(systemState.processWorkingSetBytes) / (1024.0 * 1024.0) << " MB";
     SetControlText(fpsLabel_, fps.str());
@@ -1472,16 +2129,89 @@ void AppWindow::UpdateStatus() {
     std::ostringstream precision;
     precision << "Deep zoom: requested " << PrecisionModeDisplayName(settings_.performance.precision.mode)
               << " | preview " << previewRenderer_.PrecisionDescription()
-              << " | wallpaper " << wallpaperController_.PrecisionDescription();
+              << " | desktop file-backed";
     SetControlText(precisionLabel_, precision.str());
     SetWindowTextW(pauseButton_, wallpaperController_.IsPaused() ? L"Resume" : L"Pause");
     SetWindowTextW(colourCycleButton_, previewColourCyclingEnabled_ ? L"Pause Colours" : L"Play Colours");
     UpdateQuickController();
 }
 
+void AppWindow::OpenFractalScout() {
+    ApplyControlsToWorkingPreset();
+    Preset candidate;
+    const FractalScoutAction action = FractalScoutDialog::Show(
+        window_, instance_, CurrentPreviewSnapshot(), settings_.performance, candidate);
+    if (action == FractalScoutAction::None) return;
+
+    // Scout results are temporary camera suggestions. Preserve the currently
+    // selected preset identity and style until the user explicitly saves.
+    if (!ApplyMainWindowCameraMutation(candidate.camera,
+                                       CameraMutationOrigin::ScoutApply,
+                                       true,
+                                       candidate.exactCamera ? &*candidate.exactCamera : nullptr)) return;
+
+    if (action == FractalScoutAction::UseAndSaveAsNew) SaveAsNewPreset();
+}
+
 void AppWindow::OpenHighResRenderDialog() {
     const Preset snapshot = CurrentPreviewSnapshot();
-    HighResRenderDialog::Show(window_, instance_, snapshot, settings_.performance);
+    HighResRenderDialog::Show(window_, instance_, snapshot, settings_.performance, settings_.staticWallpaper);
+}
+
+bool AppWindow::BeginExportPresentationPause(const char* reason) {
+    exportDialogOpen_ = true;
+    const bool resumePresentation = wallpaperController_.IsRunning() && !userPaused_;
+    if (resumePresentation && !wallpaperController_.IsPaused()) {
+        std::string pauseError;
+        if (!wallpaperController_.PausePresentation(reason, pauseError)) {
+            LogWarning("Export desktop pause was unavailable: " + pauseError);
+        }
+    }
+    UpdateStatus();
+    UpdateQuickController();
+    return resumePresentation;
+}
+
+void AppWindow::EndExportPresentationPause(bool resumePresentation) {
+    exportDialogOpen_ = false;
+    // Modal dialogs dispatch the owner's timer and lifecycle messages. Re-evaluate
+    // those conditions before releasing the export hold; never override a user
+    // pause, a remaining automatic pause, or a stop/failure during the dialog.
+    PollSystemState();
+    if (resumePresentation && wallpaperController_.IsRunning() &&
+        wallpaperController_.IsPaused() && !userPaused_ && !autoPaused_) {
+        wallpaperController_.Resume();
+    }
+    UpdateStatus();
+    UpdateQuickController();
+}
+
+void AppWindow::OpenFrameSequenceExportDialog() {
+    if (exportDialogOpen_) {
+        // Destruction enables the owner before the modal message loop returns.
+        // Preserve a queued reopen during that transition without nesting exports.
+        if (IsWindowEnabled(window_)) PostMessageW(window_, WM_COMMAND, ExportFramesButton, 0);
+        return;
+    }
+    ApplyControlsToWorkingPreset();
+    previewGestureCoalescer_.Reset();
+    const bool resumePresentation = BeginExportPresentationPause(
+        "Paused for deterministic frame-sequence export");
+    FrameSequenceExportDialog::Show(window_, instance_, workingPreset_,
+                                    generalAnimationTimeline_, settings_.staticWallpaper);
+    EndExportPresentationPause(resumePresentation);
+}
+
+void AppWindow::OpenVideoExportDialog() {
+    if (exportDialogOpen_) {
+        if (IsWindowEnabled(window_)) PostMessageW(window_, WM_COMMAND, ExportVideoButton, 0);
+        return;
+    }
+    previewGestureCoalescer_.Reset();
+    const bool resumePresentation = BeginExportPresentationPause(
+        "Paused for external FFmpeg video encoding");
+    VideoExportDialog::Show(window_, instance_);
+    EndExportPresentationPause(resumePresentation);
 }
 
 void AppWindow::OpenQuickController() {
@@ -1496,56 +2226,50 @@ void AppWindow::OpenQuickController() {
 
 void AppWindow::UpdateQuickController() {
     if (!quickController_.IsVisible()) return;
-    const AnimationFrame frame = lastPreviewFrame_.camera.scale > 0.0
-        ? lastPreviewFrame_ : AnimationFrame{workingPreset_.camera, workingPreset_.colourOffset};
     std::wostringstream coordinates;
-    coordinates << std::setprecision(12) << L"X " << CameraCentreX(frame.camera)
-                << L"   Y " << CameraCentreY(frame.camera)
-                << L"\r\nScale " << frame.camera.scale;
+    if (workingPreset_.exactCamera) {
+        coordinates << L"Project X " << ToWide(workingPreset_.exactCamera->centreX.CanonicalText())
+                    << L"   Y " << ToWide(workingPreset_.exactCamera->centreY.CanonicalText())
+                    << L"\r\nScale " << ToWide(workingPreset_.exactCamera->halfHeight.CanonicalText());
+    } else {
+        const AnimationFrame frame = lastPreviewFrame_.camera.scale > 0.0
+            ? lastPreviewFrame_ : AnimationFrame{workingPreset_.camera, workingPreset_.colourOffset};
+        coordinates << std::setprecision(17) << L"Preview X " << CameraCentreX(frame.camera)
+                    << L"   Y " << CameraCentreY(frame.camera)
+                    << L"\r\nScale " << frame.camera.scale;
+    }
     std::wostringstream resources;
     const auto resourceState = systemStateMonitor_.State();
     resources << std::fixed << std::setprecision(1)
-              << L"Preview " << previewRenderer_.FramesPerSecond() << L" FPS | Desktop "
-              << wallpaperController_.FramesPerSecond() << L" FPS | CPU "
+              << L"Preview " << previewRenderer_.FramesPerSecond() << L" FPS | CPU "
               << resourceState.processCpuPercent << L"% | Memory "
               << static_cast<double>(resourceState.processWorkingSetBytes) / (1024.0 * 1024.0) << L" MB";
     std::wstring status = L"Wallpaper stopped";
     if (wallpaperController_.IsPaused()) {
         status = L"Wallpaper paused — " + ToWide(wallpaperController_.PauseReason());
-        if (wallpaperController_.UsingPausedSnapshot()) status += L" — GPU released";
     }
-    else if (wallpaperController_.UsingUserStatic()) status = L"Static wallpaper active — GPU idle";
-    else if (wallpaperController_.IsRunning()) status = L"Live wallpaper running";
+    else if (wallpaperController_.UsingUserStatic()) status = L"Image wallpaper active — file-backed";
+    else if (wallpaperController_.UsingVideo()) status = L"Exported video wallpaper active — file-backed";
     quickController_.Update(status, coordinates.str(), resources.str(),
-                            zoomMotionEnabled_, previewColourCyclingEnabled_,
-                            desktopZoomMotionEnabled_, desktopColourCyclingEnabled_);
+                            zoomMotionEnabled_, previewColourCyclingEnabled_);
 }
 
 void AppWindow::ToggleZoomMotion() {
     zoomMotionEnabled_ = !zoomMotionEnabled_;
-    desktopZoomMotionEnabled_ = zoomMotionEnabled_;
     previewAnimation_.SetMotionEnabled(zoomMotionEnabled_);
-    wallpaperController_.SetMotionEnabled(desktopZoomMotionEnabled_);
     previewForceRender_ = true;
     UpdateQuickController();
 }
 
 void AppWindow::TogglePreviewZoomMotion() {
     zoomMotionEnabled_ = !zoomMotionEnabled_;
+    if (zoomMotionEnabled_ && workingPreset_.animationMode != AnimationMode::AutomaticJourney) {
+        workingPreset_.animationMode = AnimationMode::ContinuousZoom;
+        previewAnimation_.SetPreset(workingPreset_, settings_.general.reducedMotion);
+        previewAnimation_.SetColourCyclingEnabled(previewColourCyclingEnabled_);
+    }
     previewAnimation_.SetMotionEnabled(zoomMotionEnabled_);
     previewForceRender_ = true;
-    UpdateQuickController();
-}
-
-void AppWindow::ToggleDesktopZoomMotion() {
-    desktopZoomMotionEnabled_ = !desktopZoomMotionEnabled_;
-    wallpaperController_.SetMotionEnabled(desktopZoomMotionEnabled_);
-    UpdateQuickController();
-}
-
-void AppWindow::ToggleDesktopColourCycling() {
-    desktopColourCyclingEnabled_ = !desktopColourCyclingEnabled_;
-    wallpaperController_.SetColourCyclingEnabled(desktopColourCyclingEnabled_);
     UpdateQuickController();
 }
 
@@ -1557,32 +2281,174 @@ void AppWindow::ApplyPreviewAsSlideshowWallpaper() {
         settings_.staticWallpaper.enabled = true;
         settings_.staticWallpaper.cycleEnabled = true;
         StartSavedStaticWallpaper();
+        currentDesktopMode_ = DesktopMode::Slideshow;
+        SendMessageW(desktopModeCombo_, CB_SETCURSEL, static_cast<WPARAM>(currentDesktopMode_), 0);
+        UpdateDesktopModeControls();
     }
 }
 
-void AppWindow::JumpToCoordinates() {
-    std::wstring input = ToWide(FormatDouble(CameraCentreX(workingPreset_.camera)) + "," +
-                                FormatDouble(CameraCentreY(workingPreset_.camera)) + "," +
-                                FormatDouble(workingPreset_.camera.scale, 12));
-    if (!PromptForText(window_, instance_, L"Jump to Coordinates",
-                       L"Enter coordinates as centreX,centreY,scale", input, input)) return;
-    double x = 0.0; double y = 0.0; double scale = 0.0;
-    if (!ParseCoordinateTriplet(input, x, y, scale)) {
-        MessageBoxW(window_, L"Use the format centreX,centreY,scale", L"Jump to Coordinates", MB_OK | MB_ICONERROR);
+void AppWindow::UpdateDesktopModeControls() {
+    if (!desktopModeCombo_) return;
+    const int selected = SelectedComboIndex(desktopModeCombo_);
+    const auto selectedMode = selected >= 0 && selected <= static_cast<int>(DesktopMode::Video)
+        ? static_cast<DesktopMode>(selected) : DesktopMode::None;
+    const bool isDefault = settings_.general.defaultDesktopMode != DesktopMode::None &&
+                           selectedMode == settings_.general.defaultDesktopMode;
+    SetCheck(GetDlgItem(window_, DefaultDesktopModeCheck), isDefault);
+}
+
+void AppWindow::ApplySelectedDesktopMode() {
+    const int selected = SelectedComboIndex(desktopModeCombo_);
+    if (selected < 0 || selected > static_cast<int>(DesktopMode::Video)) return;
+    const auto mode = static_cast<DesktopMode>(selected);
+    const bool setAsDefault = IsChecked(GetDlgItem(window_, DefaultDesktopModeCheck));
+    if (setAsDefault) {
+        settings_.general.defaultDesktopMode = mode;
+    } else if (settings_.general.defaultDesktopMode == mode) {
+        settings_.general.defaultDesktopMode = DesktopMode::None;
+    }
+    ApplyDesktopMode(mode);
+    SaveSettings();
+    UpdateDesktopModeControls();
+}
+
+void AppWindow::ApplyDesktopMode(DesktopMode mode) {
+    SendMessageW(desktopModeCombo_, CB_SETCURSEL, static_cast<WPARAM>(mode), 0);
+    switch (mode) {
+    case DesktopMode::None:
+        StopWallpaper();
+        break;
+    case DesktopMode::StaticImage:
+        settings_.staticWallpaper.cycleEnabled = false;
+        if (!settings_.staticWallpaper.imagePaths.empty()) {
+            settings_.staticWallpaper.enabled = true;
+            StartSavedStaticWallpaper();
+        } else {
+            SetStaticWallpaper();
+        }
+        break;
+    case DesktopMode::Slideshow:
+        ApplyPreviewAsSlideshowWallpaper();
+        break;
+    case DesktopMode::Video:
+        StartSavedVideoWallpaper();
+        break;
+    }
+    UpdateDesktopModeControls();
+    UpdateQuickController();
+}
+
+void AppWindow::OpenJourneySettings() {
+    ApplyControlsToWorkingPreset();
+    previewGestureCoalescer_.Reset();
+    Preset editedPreset = workingPreset_;
+    const auto applyPreview = [this, &editedPreset]() {
+        dialogPreviewPreset_ = editedPreset;
+        previewAnimation_.SetPreset(editedPreset, settings_.general.reducedMotion);
+        previewAnimation_.SetColourCyclingEnabled(previewColourCyclingEnabled_);
+        previewAnimation_.SetMotionEnabled(zoomMotionEnabled_);
+        previewChangesPending_ = true;
+        previewForceRender_ = true;
+    };
+    const bool accepted = JourneySettingsDialog::Show(window_, instance_, editedPreset, applyPreview);
+    dialogPreviewPreset_.reset();
+    if (!accepted) {
+        previewAnimation_.SetPreset(workingPreset_, settings_.general.reducedMotion);
+        previewAnimation_.SetColourCyclingEnabled(previewColourCyclingEnabled_);
+        previewAnimation_.SetMotionEnabled(zoomMotionEnabled_);
+        previewChangesPending_ = true;
+        previewForceRender_ = true;
         return;
     }
-    workingPreset_.camera = {x, y, scale};
-    workingPreset_.animationMode = AnimationMode::ManualView;
+    if (!ApplyWorkingPresetReplacement(
+            std::move(editedPreset),
+            {ParameterMutationOrigin::UserControl,
+             ProjectPresetReplacementKind::JourneyDialog})) return;
     previewAnimation_.SetPreset(workingPreset_, settings_.general.reducedMotion);
     previewAnimation_.SetColourCyclingEnabled(previewColourCyclingEnabled_);
     previewAnimation_.SetMotionEnabled(zoomMotionEnabled_);
-    SendMessageW(animationCombo_, CB_SETCURSEL, static_cast<WPARAM>(AnimationMode::ManualView), 0);
-    SetControlText(centreXEdit_, FormatDouble(x));
-    SetControlText(centreYEdit_, FormatDouble(y));
-    SetControlText(scaleEdit_, FormatDouble(scale));
-    UpdateCoordinatesEdit();
     previewChangesPending_ = true;
     previewForceRender_ = true;
+    if (!workingPreset_.builtIn) {
+        if (Preset* stored = FindPresetMutable(workingPreset_.id)) *stored = workingPreset_;
+    }
+    SaveSettings();
+    UpdateStatus();
+}
+
+void AppWindow::OpenGeneralAnimationEditor() {
+    ApplyControlsToWorkingPreset();
+    previewGestureCoalescer_.Reset();
+    const auto result = GeneralAnimationEditorDialog::Show(
+        window_, instance_, workingPreset_, generalAnimationTimeline_,
+        generalAnimationClocks_,
+        [this](const AnimationTimeline& timeline, double timeSeconds, bool active) {
+            generalAnimationPreviewTimeline_ = timeline;
+            generalAnimationPreviewActive_ = active;
+            std::string error;
+            if (!generalAnimationClocks_.SetTime(AnimationClockDomain::Preview,
+                                                  timeSeconds, error)) {
+                LogWarning("General animation preview clock rejected: " + error);
+                generalAnimationPreviewActive_ = false;
+            }
+            // The modal timeline editor owns the message loop while it is
+            // open. Render the candidate immediately instead of depending on
+            // a later main-window WM_TIMER dispatch.
+            previewChangesPending_ = true;
+            previewForceRender_ = true;
+            lastFrameTime_ = {};
+            RenderTick();
+        });
+    generalAnimationPreviewActive_ = false;
+    previewForceRender_ = true;
+    if (!result.accepted || !result.journeyScript) return;
+
+    Preset editedPreset = workingPreset_;
+    editedPreset.automaticJourneyWaypoints = *result.journeyScript;
+    editedPreset.animationMode = AnimationMode::AutomaticJourney;
+    if (!ApplyWorkingPresetReplacement(
+            std::move(editedPreset),
+            {ParameterMutationOrigin::UserControl,
+             ProjectPresetReplacementKind::JourneyDialog})) {
+        return;
+    }
+    if (!workingPreset_.builtIn) {
+        if (Preset* stored = FindPresetMutable(workingPreset_.id)) *stored = workingPreset_;
+    }
+    previewAnimation_.SetPreset(workingPreset_, settings_.general.reducedMotion);
+    previewAnimation_.SetColourCyclingEnabled(previewColourCyclingEnabled_);
+    previewAnimation_.SetMotionEnabled(zoomMotionEnabled_);
+    previewChangesPending_ = true;
+    previewForceRender_ = true;
+    SaveSettings();
+    UpdateStatus();
+}
+
+void AppWindow::JumpToCoordinates() {
+    std::wstring input = ToWide(workingPreset_.exactCamera
+        ? workingPreset_.exactCamera->centreX.CanonicalText() + "," +
+              workingPreset_.exactCamera->centreY.CanonicalText() + "," +
+              workingPreset_.exactCamera->halfHeight.CanonicalText()
+        : FormatDouble(CameraCentreX(workingPreset_.camera)) + "," +
+              FormatDouble(CameraCentreY(workingPreset_.camera)) + "," +
+              FormatDouble(workingPreset_.camera.scale, 12));
+    if (!PromptForText(window_, instance_, L"Jump to Coordinates",
+                       L"Enter coordinates as centreX,centreY,scale", input, input)) return;
+    ExactCamera exactCamera;
+    std::string exactCameraError;
+    if (!ParseExactCoordinateTriplet(input, exactCamera, exactCameraError)) {
+        MessageBoxW(window_, L"Use the format centreX,centreY,scale", L"Jump to Coordinates", MB_OK | MB_ICONERROR);
+        return;
+    }
+    LegacyCameraAdaptation legacyCamera;
+    if (!AdaptExactCameraToLegacy(exactCamera, legacyCamera, exactCameraError) ||
+        legacyCamera.camera.scale <= 0.0) {
+        MessageBoxW(window_, L"Coordinates cannot be represented by the current preview renderer.",
+                    L"Jump to Coordinates", MB_OK | MB_ICONERROR);
+        return;
+    }
+    (void)ApplyMainWindowCameraMutation(legacyCamera.camera, CameraMutationOrigin::Jump,
+                                        true, &exactCamera);
 }
 
 void AppWindow::SelectRelativePreset(int direction) {
@@ -1592,10 +2458,6 @@ void AppWindow::SelectRelativePreset(int direction) {
     index = (index + direction + count) % count;
     SendMessageW(presetCombo_, CB_SETCURSEL, index, 0);
     LoadSelectedPreset();
-    if (wallpaperController_.IsRunning()) {
-        wallpaperController_.SelectPreset(settings_.selectedPresetId);
-        previewChangesPending_ = false;
-    }
     SaveSettings();
 }
 
@@ -1699,8 +2561,37 @@ void AppWindow::RestoreBuiltInPresets() {
 
 void AppWindow::OpenSettings() {
     ApplyControlsToWorkingPreset();
+    previewGestureCoalescer_.Reset();
     const bool previousStartup = StartupManager::IsEnabled();
-    if (SettingsDialog::Show(window_, instance_, settings_, workingPreset_, AllPresets())) {
+    const PrecisionSettings previousPrecision = settings_.performance.precision;
+    AppSettings editedSettings = settings_;
+    Preset editedPreset = workingPreset_;
+    const auto applyPreview = [this, &editedPreset, &editedSettings]() {
+        dialogPreviewPreset_ = editedPreset;
+        dialogPreviewSettings_ = editedSettings;
+        previewAnimation_.SetPreset(editedPreset, editedSettings.general.reducedMotion);
+        previewAnimation_.SetColourCyclingEnabled(previewColourCyclingEnabled_);
+        previewAnimation_.SetMotionEnabled(zoomMotionEnabled_);
+        previewChangesPending_ = true;
+        previewForceRender_ = true;
+    };
+    const bool accepted = SettingsDialog::Show(window_, instance_, editedSettings, editedPreset,
+                                               AllPresets(), applyPreview);
+    dialogPreviewPreset_.reset();
+    dialogPreviewSettings_.reset();
+    if (accepted) {
+        if (!ApplyWorkingPresetReplacement(
+                std::move(editedPreset),
+                {ParameterMutationOrigin::UserControl,
+                 ProjectPresetReplacementKind::SettingsDialog})) {
+            previewAnimation_.SetPreset(workingPreset_, settings_.general.reducedMotion);
+            previewAnimation_.SetColourCyclingEnabled(previewColourCyclingEnabled_);
+            previewAnimation_.SetMotionEnabled(zoomMotionEnabled_);
+            previewChangesPending_ = true;
+            previewForceRender_ = true;
+            return;
+        }
+        settings_ = std::move(editedSettings);
         SendMessageW(performanceCombo_, CB_SETCURSEL, static_cast<WPARAM>(settings_.performance.profile), 0);
         SendMessageW(monitorModeCombo_, CB_SETCURSEL, static_cast<WPARAM>(settings_.monitorMode), 0);
         SendMessageW(iterationsTrack_, TBM_SETPOS, TRUE, workingPreset_.maximumIterations);
@@ -1733,16 +2624,30 @@ void AppWindow::OpenSettings() {
         }
 
         SyncNumericEditsFromTracks();
-        UpdateCoordinatesEdit();
+        SyncMainWindowCameraControls();
         PopulateMonitorControls();
+        SendMessageW(desktopModeCombo_, CB_SETCURSEL,
+                     static_cast<WPARAM>(currentDesktopMode_), 0);
+        UpdateDesktopModeControls();
         previewAnimation_.SetPreset(workingPreset_, settings_.general.reducedMotion);
         previewAnimation_.SetColourCyclingEnabled(previewColourCyclingEnabled_);
         previewAnimation_.SetMotionEnabled(zoomMotionEnabled_);
         wallpaperController_.UpdateConfiguration(settings_, AllPresets());
         previewChangesPending_ = true;
-        previewForceRender_ = true;
+        if (settings_.performance.precision != previousPrecision || !previewRenderer_.IsReady()) {
+            RestartPreviewRenderer();
+        } else {
+            previewForceRender_ = true;
+        }
         SaveSettings();
         UpdateStatus();
+    } else {
+        previewAnimation_.SetPreset(workingPreset_, settings_.general.reducedMotion);
+        previewAnimation_.SetColourCyclingEnabled(previewColourCyclingEnabled_);
+        previewAnimation_.SetMotionEnabled(zoomMotionEnabled_);
+        previewChangesPending_ = true;
+        if (!previewRenderer_.IsReady()) RestartPreviewRenderer();
+        else previewForceRender_ = true;
     }
 }
 
@@ -1751,13 +2656,26 @@ void AppWindow::DeleteSelectedPreset() {
         MessageBoxW(window_, L"Built-in presets cannot be deleted. Use Save as New to create an editable copy.", L"Built-in Preset", MB_OK | MB_ICONINFORMATION);
         return;
     }
+    const std::wstring confirmation = L"Delete the custom preset \"" +
+        ToWide(workingPreset_.name) + L"\"? This cannot be undone.";
+    if (MessageBoxW(window_, confirmation.c_str(), L"Delete Custom Preset",
+                    MB_YESNO | MB_DEFBUTTON2 | MB_ICONWARNING) != IDYES) return;
+    const auto previousCustomPresets = settings_.customPresets;
+    const std::string previousSelectedPreset = settings_.selectedPresetId;
     settings_.customPresets.erase(std::remove_if(settings_.customPresets.begin(), settings_.customPresets.end(),
                                                   [&](const Preset& preset) { return preset.id == workingPreset_.id; }),
-                                   settings_.customPresets.end());
+    settings_.customPresets.end());
     settings_.selectedPresetId = builtInPresets_.front().id;
+    std::string saveError;
+    if (!SaveSettings(&saveError)) {
+        settings_.customPresets = previousCustomPresets;
+        settings_.selectedPresetId = previousSelectedPreset;
+        MessageBoxW(window_, ToWide("The preset could not be deleted. " + saveError).c_str(),
+                    L"Delete Custom Preset", MB_OK | MB_ICONERROR);
+        return;
+    }
     PopulatePresetCombo();
     LoadSelectedPreset();
-    SaveSettings();
 }
 
 void AppWindow::ImportPreset() {
@@ -1781,7 +2699,8 @@ void AppWindow::ImportPreset() {
     settings_.customPresets.push_back(*preset);
     settings_.selectedPresetId = preset->id;
     PopulatePresetCombo();
-    LoadSelectedPreset();
+    LoadSelectedPreset({ParameterMutationOrigin::Import,
+                        ProjectPresetReplacementKind::ImportedPreset});
     SaveSettings();
 }
 
@@ -1793,30 +2712,6 @@ void AppWindow::ExportPreset() {
     if (!WriteTextFile(path, SettingsStore::SerialisePreset(workingPreset_), error)) {
         MessageBoxW(window_, ToWide(error).c_str(), L"Preset Export", MB_OK | MB_ICONERROR);
     }
-}
-
-void AppWindow::AssignPresetToMonitor() {
-    if (settings_.monitorMode != MonitorMode::Independent) {
-        MessageBoxW(window_, L"Monitor assignments are used only in Independent mode. Select Independent under Monitor mode first.",
-                    L"Monitor Assignment", MB_OK | MB_ICONINFORMATION);
-        return;
-    }
-    const auto displays = DisplayManager::Enumerate();
-    const auto presets = AllPresets();
-    const int monitorIndex = SelectedComboIndex(monitorCombo_);
-    const int presetIndex = SelectedComboIndex(monitorAssignmentCombo_);
-    if (monitorIndex < 0 || monitorIndex >= static_cast<int>(displays.size()) || presetIndex < 0 || presetIndex >= static_cast<int>(presets.size())) return;
-    const std::string key = ToUtf8(displays[static_cast<std::size_t>(monitorIndex)].deviceName);
-    settings_.monitorPresetAssignments[key] = presets[static_cast<std::size_t>(presetIndex)].id;
-    wallpaperController_.UpdateConfiguration(settings_, presets);
-    SaveSettings();
-    std::wstring message = L"Assigned \"" + ToWide(presets[static_cast<std::size_t>(presetIndex)].name) +
-                           L"\" to " + displays[static_cast<std::size_t>(monitorIndex)].friendlyName + L".";
-    if (!wallpaperController_.IsRunning() || wallpaperController_.UsingUserStatic()) {
-        message += L" The assignment is saved and will appear the next time you apply a live wallpaper.";
-    }
-    MessageBoxW(window_, message.c_str(), L"Monitor Assignment Applied", MB_OK | MB_ICONINFORMATION);
-    PopulateMonitorControls();
 }
 
 void AppWindow::ToggleStartup() {
@@ -1844,17 +2739,11 @@ void AppWindow::CopyDiagnostics() {
     diagnostics << "Preview GPU: " << (previewGpu.empty() ? "unavailable" : previewGpu);
     if (previewGpu.empty() && !previewRendererError_.empty()) diagnostics << " — " << previewRendererError_;
     diagnostics << '\n';
-    const std::string wallpaperGpu = wallpaperController_.GraphicsDescription();
-    diagnostics << "Wallpaper GPU: " << (wallpaperGpu.empty() ? "unavailable" : wallpaperGpu);
-    if (wallpaperGpu.empty() && !wallpaperController_.LastRendererError().empty()) {
-        diagnostics << " — " << wallpaperController_.LastRendererError();
-    }
-    diagnostics << '\n';
-    diagnostics << "Wallpaper renderer mode: ";
-    if (wallpaperController_.UsingUserStatic()) diagnostics << "saved static image (GPU idle)";
-    else if (wallpaperController_.UsingPausedSnapshot()) diagnostics << "captured paused frame (GPU released)";
-    else if (wallpaperController_.UsingStaticFallback()) diagnostics << "static CPU fallback";
-    else diagnostics << "GPU";
+    diagnostics << "Desktop presentation: ";
+    if (wallpaperController_.UsingUserStatic()) diagnostics << "decoded saved image/slideshow";
+    else if (wallpaperController_.UsingVideo()) diagnostics << "exported MP4 via Windows Media Foundation";
+    else diagnostics << "stopped";
+    if (wallpaperController_.IsPaused()) diagnostics << " (paused)";
     diagnostics << '\n';
     diagnostics << "Profile: " << ToString(settings_.performance.profile) << '\n';
     const auto resourceState = systemStateMonitor_.State();
@@ -1866,15 +2755,13 @@ void AppWindow::CopyDiagnostics() {
                 << " | low-FPS=" << (settings_.performance.adaptive.pauseOnLowFps ? "on" : "off")
                 << " | high-CPU=" << (settings_.performance.adaptive.pauseOnHighCpu ? "on" : "off")
                 << " | high-memory=" << (settings_.performance.adaptive.pauseOnHighMemory ? "on" : "off") << '\n';
-    diagnostics << "Invisible-frame suppression: "
+    diagnostics << "Preview invisible-frame suppression: "
                 << (settings_.performance.adaptive.stopWhenVisuallyUnchanged ? "enabled" : "disabled")
-                << " | preview-idle=" << (previewChangeDetector_.IsVisuallyIdle() ? "yes" : "no")
-                << " | wallpaper-idle=" << (wallpaperController_.IsVisuallyIdle() ? "yes" : "no")
-                << " | preview-skipped=" << previewChangeDetector_.SkippedFrameCount()
-                << " | wallpaper-skipped=" << wallpaperController_.SkippedInvisibleFrames() << '\n';
+                << " | idle=" << (previewChangeDetector_.IsVisuallyIdle() ? "yes" : "no")
+                << " | skipped=" << previewChangeDetector_.SkippedFrameCount() << '\n';
     diagnostics << "Precision requested: " << PrecisionModeDisplayName(settings_.performance.precision.mode) << '\n';
     diagnostics << "Preview precision active: " << previewRenderer_.PrecisionDescription() << '\n';
-    diagnostics << "Wallpaper precision active: " << wallpaperController_.PrecisionDescription() << '\n';
+    diagnostics << "Desktop precision: not applicable to decoded image/video files\n";
     const auto precisionCaps = previewRenderer_.Capabilities();
     diagnostics << "Precision capabilities: float64=" << (precisionCaps.nativeFloat64 ? "yes" : "no")
                 << ", split=yes, perturbation=" << (precisionCaps.perturbation ? "yes" : "no")
@@ -1883,7 +2770,8 @@ void AppWindow::CopyDiagnostics() {
     diagnostics << "Preview activity: " << (previewFrozen ? "frozen while main editor is hidden" : "active") << '\n';
     diagnostics << "Preview changes pending: " << (previewChangesPending_ ? "yes" : "no") << '\n';
     diagnostics << "Preview colour cycling: " << (previewColourCyclingEnabled_ ? "playing" : "paused") << '\n';
-    diagnostics << "Desktop colour cycling: " << (desktopColourCyclingEnabled_ ? "playing" : "paused") << '\n';
+    diagnostics << "Video wallpaper file: "
+                << (settings_.videoWallpaper.filePath.empty() ? "not selected" : settings_.videoWallpaper.filePath) << '\n';
     diagnostics << "Equation: " << EquationSummary(workingPreset_.equation) << '\n';
     diagnostics << "Static slideshow: " << settings_.staticWallpaper.imagePaths.size()
                 << " images | cycle: " << (settings_.staticWallpaper.cycleEnabled ? "enabled" : "disabled")
@@ -1908,12 +2796,7 @@ void AppWindow::CopyDiagnostics() {
         const std::string key = ToUtf8(display.deviceName);
         diagnostics << "Monitor " << key << ": " << ToUtf8(display.friendlyName)
                     << " [" << display.bounds.left << ',' << display.bounds.top << " to "
-                    << display.bounds.right << ',' << display.bounds.bottom << ']';
-        const auto assignment = settings_.monitorPresetAssignments.find(key);
-        if (assignment != settings_.monitorPresetAssignments.end()) {
-            diagnostics << " | assigned preset=" << assignment->second;
-        }
-        diagnostics << '\n';
+                    << display.bounds.right << ',' << display.bounds.bottom << "]\n";
     }
     const std::wstring text = ToWide(diagnostics.str());
     if (!CopyUnicodeText(window_, text)) {
@@ -1923,12 +2806,18 @@ void AppWindow::CopyDiagnostics() {
 }
 
 void AppWindow::CopyCoordinates() {
-    const AnimationFrame frame = lastPreviewFrame_.camera.scale > 0.0
-        ? lastPreviewFrame_ : AnimationFrame{workingPreset_.camera, workingPreset_.colourOffset};
     std::wostringstream coordinates;
-    coordinates << std::setprecision(17)
-                << CameraCentreX(frame.camera) << L"," << CameraCentreY(frame.camera)
-                << L"," << frame.camera.scale;
+    if (workingPreset_.exactCamera) {
+        coordinates << ToWide(workingPreset_.exactCamera->centreX.CanonicalText()) << L","
+                    << ToWide(workingPreset_.exactCamera->centreY.CanonicalText()) << L","
+                    << ToWide(workingPreset_.exactCamera->halfHeight.CanonicalText());
+    } else {
+        const AnimationFrame frame = lastPreviewFrame_.camera.scale > 0.0
+            ? lastPreviewFrame_ : AnimationFrame{workingPreset_.camera, workingPreset_.colourOffset};
+        coordinates << std::setprecision(17)
+                    << CameraCentreX(frame.camera) << L"," << CameraCentreY(frame.camera)
+                    << L"," << frame.camera.scale;
+    }
     if (!CopyUnicodeText(window_, coordinates.str())) {
         MessageBoxW(window_, L"The coordinates could not be copied to the clipboard.",
                     L"Copy Coordinates", MB_OK | MB_ICONERROR);
@@ -1938,12 +2827,16 @@ void AppWindow::CopyCoordinates() {
 }
 
 void AppWindow::ClearLogs() {
+    if (MessageBoxW(window_, L"Clear the local application logs? This cannot be undone.",
+                    L"Clear Logs", MB_YESNO | MB_DEFBUTTON2 | MB_ICONWARNING) != IDYES) return;
     Logger::Instance().Clear();
+    MessageBoxW(window_, L"The local application logs were cleared.",
+                L"Clear Logs", MB_OK | MB_ICONINFORMATION);
 }
 
 void AppWindow::ShowRendererError(const std::string& detail) {
     LogError("Renderer error: " + detail);
-    MessageBoxW(window_, L"The Mandelbrot renderer could not start. The live wallpaper will remain stopped. Try the Battery Saver profile or update the graphics driver.",
+    MessageBoxW(window_, L"The Mandelbrot preview renderer could not start. Image and video desktop backgrounds remain available. Try the Battery Saver profile or update the graphics driver.",
                 L"Renderer Error", MB_OK | MB_ICONERROR);
 }
 
@@ -1971,27 +2864,37 @@ LRESULT AppWindow::HandlePreviewMessage(HWND window, UINT message, WPARAM wParam
     if (message == WM_LBUTTONDOWN) {
         draggingPreview_ = true;
         dragStart_ = {GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+        (void)previewGestureCoalescer_.ContinueOrBegin(
+            ParameterGestureKind::PreviewNavigation, MonotonicMilliseconds(),
+            kPreviewNavigationCoalescingWindowMilliseconds);
         SetCapture(window);
         return 0;
     }
     if (message == WM_MOUSEMOVE && draggingPreview_) {
+        (void)previewGestureCoalescer_.ContinueOrBegin(
+            ParameterGestureKind::PreviewNavigation, MonotonicMilliseconds(),
+            kPreviewNavigationCoalescingWindowMilliseconds);
         RECT client{};
         GetClientRect(window, &client);
         const POINT current{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
         const double dx = static_cast<double>(current.x - dragStart_.x) / std::max(1L, client.right);
         const double dy = static_cast<double>(current.y - dragStart_.y) / std::max(1L, client.bottom);
-        previewAnimation_.Pan(dx, dy, static_cast<double>(std::max(1L, client.right)) / std::max(1L, client.bottom));
-        workingPreset_.camera = previewAnimation_.Camera();
-        previewChangesPending_ = true;
-        SetControlText(centreXEdit_, FormatDouble(CameraCentreX(workingPreset_.camera)));
-        SetControlText(centreYEdit_, FormatDouble(CameraCentreY(workingPreset_.camera)));
-        UpdateCoordinatesEdit();
+        previewAnimation_.Pan(dx, dy, static_cast<double>(std::max(1L, client.right)) / std::max(1L, client.bottom),
+                              workingPreset_.rotationDegrees);
+        (void)ApplyMainWindowCameraMutation(previewAnimation_.Camera(),
+                                            CameraMutationOrigin::PreviewPan);
         dragStart_ = current;
         return 0;
     }
-    if (message == WM_LBUTTONUP) {
+    if (message == WM_LBUTTONUP && draggingPreview_) {
         draggingPreview_ = false;
         ReleaseCapture();
+        UpdateStatus();
+        return 0;
+    }
+    if (message == WM_CAPTURECHANGED && draggingPreview_) {
+        draggingPreview_ = false;
+        UpdateStatus();
         return 0;
     }
     if (message == WM_MOUSEWHEEL) {
@@ -2002,13 +2905,14 @@ LRESULT AppWindow::HandlePreviewMessage(HWND window, UINT message, WPARAM wParam
         const double nx = (static_cast<double>(point.x) / std::max(1L, client.right)) * 2.0 - 1.0;
         const double ny = 1.0 - (static_cast<double>(point.y) / std::max(1L, client.bottom)) * 2.0;
         const double steps = static_cast<double>(GET_WHEEL_DELTA_WPARAM(wParam)) / WHEEL_DELTA;
-        previewAnimation_.ZoomAt(nx, ny, steps, static_cast<double>(std::max(1L, client.right)) / std::max(1L, client.bottom));
-        workingPreset_.camera = previewAnimation_.Camera();
-        previewChangesPending_ = true;
-        SetControlText(centreXEdit_, FormatDouble(CameraCentreX(workingPreset_.camera)));
-        SetControlText(centreYEdit_, FormatDouble(CameraCentreY(workingPreset_.camera)));
-        SetControlText(scaleEdit_, FormatDouble(workingPreset_.camera.scale));
-        UpdateCoordinatesEdit();
+        (void)previewGestureCoalescer_.ContinueOrBegin(
+            ParameterGestureKind::PreviewNavigation, MonotonicMilliseconds(),
+            kPreviewNavigationCoalescingWindowMilliseconds);
+        previewAnimation_.ZoomAt(nx, ny, steps, static_cast<double>(std::max(1L, client.right)) / std::max(1L, client.bottom),
+                                 workingPreset_.rotationDegrees);
+        (void)ApplyMainWindowCameraMutation(previewAnimation_.Camera(),
+                                            CameraMutationOrigin::PreviewWheelZoom);
+        UpdateStatus();
         return 0;
     }
     if (message == WM_PAINT) {
@@ -2021,7 +2925,7 @@ LRESULT AppWindow::HandlePreviewMessage(HWND window, UINT message, WPARAM wParam
             SetBkMode(dc, TRANSPARENT);
             SetTextColor(dc, RGB(225, 225, 225));
             HFONT previous = static_cast<HFONT>(SelectObject(dc, uiFont_));
-            const std::wstring messageText = L"GPU preview unavailable. The wallpaper will use its static fallback.\nSee the log for shader details.";
+            const std::wstring messageText = L"GPU preview unavailable.\nDesktop image and video presentation is unaffected. See the log for shader details.";
             RECT textRect = client;
             InflateRect(&textRect, -32, -32);
             DrawTextW(dc, messageText.c_str(), -1, &textRect, DT_CENTER | DT_VCENTER | DT_WORDBREAK | DT_NOPREFIX);
@@ -2041,12 +2945,57 @@ LRESULT AppWindow::HandlePreviewMessage(HWND window, UINT message, WPARAM wParam
     return DefWindowProcW(window, message, wParam, lParam);
 }
 
+AppWindow::AuxiliaryWindowSession::AuxiliaryWindowSession(AppWindow& app)
+    : app_(app), controller_(app.quickController_.Window()),
+      controllerWasEnabled_(controller_ && IsWindowEnabled(controller_)) {
+    app_.auxiliaryWindowOpen_ = true;
+    EnableWindow(app_.window_, FALSE);
+    if (controller_) EnableWindow(controller_, FALSE);
+}
+
+AppWindow::AuxiliaryWindowSession::~AuxiliaryWindowSession() {
+    // Keep the command gate held until the dialog candidate has committed or
+    // rolled back, not merely until its native window has been destroyed.
+    app_.auxiliaryWindowOpen_ = false;
+    if (IsWindow(controller_)) EnableWindow(controller_, controllerWasEnabled_);
+    if (IsWindow(app_.window_)) EnableWindow(app_.window_, TRUE);
+}
+
+bool AppWindow::OpensAuxiliaryWindow(int command) {
+    switch (command) {
+    case NavigationSettingsButton: case NavigationPaletteButton: case NavigationControllerButton:
+    case NavigationEquationButton:
+    case PresetLibraryButton: case SetWallpaperButton: case SetStaticWallpaperButton:
+    case AddSlideshowButton: case ManageSlideshowButton: case ApplyDesktopModeButton:
+    case JourneySettingsButton: case GeneralAnimationButton: case PaletteEditorButton:
+    case EquationEditorButton: case SaveNewButton: case SaveChangesButton:
+    case RestoreBuiltInsButton: case OpenSettingsButton: case ConfigurePrecisionButton:
+    case DeletePresetButton: case ImportPresetButton: case ExportPresetButton:
+    case ClearLogsButton: case OpenLogsButton: case OpenControllerButton:
+    case FractalScoutButton: case RenderHighResButton:
+    case ExportFramesButton: case ExportVideoButton:
+    case QuickControllerCommands::VideoDesktop: case QuickControllerCommands::SaveImage:
+    case QuickControllerCommands::StaticDesktop: case QuickControllerCommands::JumpToCoordinates:
+    case QuickControllerCommands::SlideshowDesktop: case QuickControllerCommands::RenderHighRes:
+    case QuickControllerCommands::JourneySettings: case QuickControllerCommands::LoadPreset:
+    case TrayCommands::Controller:
+        return true;
+    default:
+        return false;
+    }
+}
+
 LRESULT AppWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
     if (message == taskbarCreatedMessage_ && taskbarCreatedMessage_ != 0) {
         trayIcon_.Create(window_, icon_, L"Mandelbrot Live Wallpaper");
         return 0;
     }
     switch (message) {
+    case WM_ENABLE:
+        // Several legacy dialogs enable their owner during WM_DESTROY. The
+        // session owns restoration after their message loop and commit return.
+        if (wParam && auxiliaryWindowOpen_) EnableWindow(window_, FALSE);
+        return 0;
     case WM_CREATE:
         CreateControls();
         return 0;
@@ -2059,8 +3008,8 @@ LRESULT AppWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
         return 0;
     case WM_GETMINMAXINFO: {
         auto* info = reinterpret_cast<MINMAXINFO*>(lParam);
-        info->ptMinTrackSize.x = 900;
-        info->ptMinTrackSize.y = 640;
+        info->ptMinTrackSize.x = ScaleDialogMetric(900, mainDpi_);
+        info->ptMinTrackSize.y = ScaleDialogMetric(640, mainDpi_);
         return 0;
     }
     case WM_NOTIFY: {
@@ -2074,19 +3023,41 @@ LRESULT AppWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
     case WM_TIMER:
         if (wParam == TimerId) RenderTick();
         return 0;
-    case WM_HSCROLL:
-        if (reinterpret_cast<HWND>(lParam) == fpsTrack_ ||
-            reinterpret_cast<HWND>(lParam) == renderScaleTrack_ ||
-            reinterpret_cast<HWND>(lParam) == iterationsTrack_) {
+    case WM_HSCROLL: {
+        const HWND source = reinterpret_cast<HWND>(lParam);
+        if (source == fpsTrack_ || source == renderScaleTrack_ || source == iterationsTrack_) {
             SendMessageW(performanceCombo_, CB_SETCURSEL,
                          static_cast<WPARAM>(PerformanceProfile::Custom), 0);
         }
+        const int scrollCode = LOWORD(wParam);
+        if (source == colourOffsetTrack_ && scrollCode == TB_THUMBTRACK &&
+            previewGestureCoalescer_.ActiveToken(ParameterGestureKind::PaletteControl) == 0U) {
+            (void)previewGestureCoalescer_.Begin(ParameterGestureKind::PaletteControl);
+        }
         SyncNumericEditsFromTracks();
-        ApplyControlsToWorkingPreset();
+        if (source == brightnessTrack_ || source == contrastTrack_ ||
+            source == saturationTrack_ || source == colourOffsetTrack_) {
+            (void)ApplyMainWindowPalettePostControls();
+        } else {
+            ApplyControlsToWorkingPreset();
+        }
+        if (source == colourOffsetTrack_ && scrollCode == TB_ENDTRACK) {
+            previewGestureCoalescer_.End(ParameterGestureKind::PaletteControl);
+        }
         return 0;
+    }
     case WM_COMMAND: {
         const int id = LOWORD(wParam);
         const int notification = HIWORD(wParam);
+        if (auxiliaryWindowOpen_ || !IsWindowEnabled(window_)) {
+            // Stop and Exit remain recovery actions; competing state edits,
+            // dialog launches and delayed Quick Controller/tray commands do not.
+            if (id == StopButton || id == TrayCommands::Stop) StopWallpaper();
+            else if (id == QuickControllerCommands::ExitApp || id == TrayCommands::Exit) ExitApplication();
+            return 0;
+        }
+        std::optional<AuxiliaryWindowSession> dialogSession;
+        if (OpensAuxiliaryWindow(id)) dialogSession.emplace(*this);
         if (id == NavigationPreviewButton) SelectPage(0);
         else if (id == NavigationWallpaperButton) SelectPage(1);
         else if (id == NavigationDiagnosticsButton) SelectPage(2);
@@ -2096,23 +3067,26 @@ LRESULT AppWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
         else if (id == NavigationEquationButton) OpenEquationEditor();
         else if (id == PresetLibraryButton) OpenPresetLibrary();
         else if (id == CoordinatesEdit && notification == EN_KILLFOCUS) {
-            if (ApplyCoordinatesEdit(true)) {
-                previewAnimation_.SetPreset(workingPreset_, settings_.general.reducedMotion);
-                previewAnimation_.SetColourCyclingEnabled(previewColourCyclingEnabled_);
-                previewAnimation_.SetMotionEnabled(zoomMotionEnabled_);
-                previewChangesPending_ = true;
-                previewForceRender_ = true;
+            (void)ApplyCoordinatesEdit(true, true);
+        }
+        else if (id == RotationEdit && notification == EN_KILLFOCUS) {
+            try {
+                const double rotation = std::stod(ReadControlText(rotationEdit_));
+                if (!std::isfinite(rotation)) throw std::invalid_argument("non-finite");
+                (void)ApplyMainWindowRotationMutation(rotation);
+            } catch (...) {
+                SetControlText(rotationEdit_, FormatDouble(workingPreset_.rotationDegrees, 8));
+                MessageBoxW(window_, L"Rotation must be a finite number of degrees.",
+                            L"Rotation", MB_OK | MB_ICONERROR);
             }
         }
         else if (id == PresetCombo && notification == CBN_SELCHANGE) LoadSelectedPreset();
-        else if ((id == PaletteCombo || id == AnimationCombo) && notification == CBN_SELCHANGE) ApplyControlsToWorkingPreset();
+        else if (id == PaletteCombo && notification == CBN_SELCHANGE)
+            (void)ApplyMainWindowPaletteSelection();
         else if (id == MonitorModeCombo && notification == CBN_SELCHANGE) {
             ApplyControlsToWorkingPreset();
-            UpdateMonitorAssignmentControls();
-            LoadMonitorAssignmentSelection();
             PopulateMonitorControls();
         }
-        else if (id == MonitorCombo && notification == CBN_SELCHANGE) LoadMonitorAssignmentSelection();
         else if (id == PerformanceCombo && notification == CBN_SELCHANGE) ApplyPerformanceProfile();
         else if ((id == IterationsEdit || id == FpsEdit || id == RenderScaleEdit ||
                   id == BrightnessEdit || id == ContrastEdit || id == SaturationEdit ||
@@ -2122,27 +3096,32 @@ LRESULT AppWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
                 SendMessageW(performanceCombo_, CB_SETCURSEL,
                              static_cast<WPARAM>(PerformanceProfile::Custom), 0);
             }
-            ApplyControlsToWorkingPreset();
+            if (id == BrightnessEdit || id == ContrastEdit ||
+                id == SaturationEdit || id == ColourOffsetEdit) {
+                (void)ApplyMainWindowPalettePostControls();
+            } else {
+                ApplyControlsToWorkingPreset();
+            }
         }
-        else if (id == SetWallpaperButton) SetWallpaper();
+        else if (id == SetWallpaperButton) SelectVideoWallpaper();
         else if (id == SetStaticWallpaperButton) SetStaticWallpaper();
         else if (id == AddSlideshowButton) AddPreviewToSlideshow();
         else if (id == ManageSlideshowButton) ManageSlideshow();
+        else if (id == DesktopModeCombo && notification == CBN_SELCHANGE) UpdateDesktopModeControls();
+        else if (id == ApplyDesktopModeButton) ApplySelectedDesktopMode();
+        else if (id == JourneySettingsButton) OpenJourneySettings();
+        else if (id == GeneralAnimationButton) OpenGeneralAnimationEditor();
         else if (id == PaletteEditorButton) OpenPaletteEditor();
         else if (id == EquationEditorButton) OpenEquationEditor();
         else if (id == PauseButton) TogglePause();
         else if (id == ColourCycleButton) ToggleColourCycling();
         else if (id == StopButton) StopWallpaper();
+        else if (id == UndoButton) UndoProjectEdit();
+        else if (id == RedoButton) RedoProjectEdit();
         else if (id == ResetViewButton) {
             if (const Preset* selected = FindPreset(settings_.selectedPresetId)) {
-                workingPreset_.camera = selected->camera;
-                previewAnimation_.SetPreset(workingPreset_, settings_.general.reducedMotion);
-                previewAnimation_.SetColourCyclingEnabled(previewColourCyclingEnabled_);
-                previewAnimation_.SetMotionEnabled(zoomMotionEnabled_);
-                SetControlText(centreXEdit_, FormatDouble(CameraCentreX(workingPreset_.camera)));
-                SetControlText(centreYEdit_, FormatDouble(CameraCentreY(workingPreset_.camera)));
-                SetControlText(scaleEdit_, FormatDouble(workingPreset_.camera.scale));
-                UpdateCoordinatesEdit();
+                (void)ApplyMainWindowCameraMutation(selected->camera,
+                                                    CameraMutationOrigin::ResetView);
             }
         }
         else if (id == SaveNewButton) SaveAsNewPreset();
@@ -2153,6 +3132,7 @@ LRESULT AppWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
             ApplyControlsToWorkingPreset();
             if (PrecisionDialog::Show(window_, instance_, settings_.performance.precision)) {
                 previewChangesPending_ = true;
+                RestartPreviewRenderer();
                 SaveSettings();
                 UpdateStatus();
             }
@@ -2160,15 +3140,17 @@ LRESULT AppWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
         else if (id == DeletePresetButton) DeleteSelectedPreset();
         else if (id == ImportPresetButton) ImportPreset();
         else if (id == ExportPresetButton) ExportPreset();
-        else if (id == AssignMonitorButton) AssignPresetToMonitor();
         else if (id == StartupCheck) ToggleStartup();
         else if (id == FullscreenCheck || id == BatteryCheck || id == RemoteCheck || id == ReducedMotionCheck) { ApplyControlsToWorkingPreset(); SaveSettings(); }
         else if (id == OpenLogsButton) OpenLogFolder();
         else if (id == CopyDiagnosticsButton) CopyDiagnostics();
         else if (id == ClearLogsButton) ClearLogs();
         else if (id == OpenControllerButton) OpenQuickController();
+        else if (id == FractalScoutButton) OpenFractalScout();
         else if (id == RenderHighResButton) OpenHighResRenderDialog();
-        else if (id == QuickControllerCommands::ApplySettingsLive) SetWallpaper();
+        else if (id == ExportFramesButton) OpenFrameSequenceExportDialog();
+        else if (id == ExportVideoButton) OpenVideoExportDialog();
+        else if (id == QuickControllerCommands::VideoDesktop) SelectVideoWallpaper();
         else if (id == QuickControllerCommands::SaveImage) AddPreviewToSlideshow();
         else if (id == QuickControllerCommands::StaticDesktop) SetStaticWallpaper();
         else if (id == QuickControllerCommands::TogglePreviewZoom) TogglePreviewZoomMotion();
@@ -2176,10 +3158,9 @@ LRESULT AppWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
         else if (id == QuickControllerCommands::CopyCoordinates) CopyCoordinates();
         else if (id == QuickControllerCommands::ExitApp) ExitApplication();
         else if (id == QuickControllerCommands::JumpToCoordinates) JumpToCoordinates();
-        else if (id == QuickControllerCommands::ToggleDesktopZoom) ToggleDesktopZoomMotion();
-        else if (id == QuickControllerCommands::ToggleDesktopColours) ToggleDesktopColourCycling();
         else if (id == QuickControllerCommands::SlideshowDesktop) ApplyPreviewAsSlideshowWallpaper();
         else if (id == QuickControllerCommands::RenderHighRes) OpenHighResRenderDialog();
+        else if (id == QuickControllerCommands::JourneySettings) OpenJourneySettings();
         else if (id == QuickControllerCommands::LoadPreset) { OpenPresetLibrary(true); }
         else if (id == QuickControllerCommands::Edit) { ShowWindowAndActivate(); SelectPage(0); }
         else if (id == TrayCommands::Open) ShowWindowAndActivate();
@@ -2202,10 +3183,32 @@ LRESULT AppWindow::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
         }
         return 0;
     case WM_DISPLAYCHANGE:
-    case WM_DPICHANGED:
         PopulateMonitorControls();
         wallpaperController_.HandleDisplayChange();
         return 0;
+    case WM_DPICHANGED: {
+        const RECT suggested = *reinterpret_cast<const RECT*>(lParam);
+        SetWindowPos(window_, nullptr, suggested.left, suggested.top,
+                     suggested.right - suggested.left, suggested.bottom - suggested.top,
+                     SWP_NOACTIVATE | SWP_NOZORDER);
+        mainDpi_ = std::clamp(static_cast<UINT>(HIWORD(wParam)), 48U, 768U);
+        HFONT newFont = CreateResponsiveDialogFont(mainDpi_);
+        if (newFont) {
+            HFONT oldFont = uiFont_;
+            uiFont_ = newFont;
+            for (HWND child = GetWindow(window_, GW_CHILD); child;
+                 child = GetWindow(child, GW_HWNDNEXT)) {
+                SendMessageW(child, WM_SETFONT, reinterpret_cast<WPARAM>(uiFont_), TRUE);
+            }
+            if (oldFont) DeleteObject(oldFont);
+        }
+        RECT client{};
+        GetClientRect(window_, &client);
+        LayoutControls(client.right - client.left, client.bottom - client.top);
+        PopulateMonitorControls();
+        wallpaperController_.HandleDisplayChange();
+        return 0;
+    }
     case WM_WTSSESSION_CHANGE:
     case WM_POWERBROADCAST:
         systemStateMonitor_.HandleMessage(message, wParam, lParam);

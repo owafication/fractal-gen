@@ -220,6 +220,17 @@ RECT ResponsiveDialogRect(HWND owner, int widthAt96Dpi, int heightAt96Dpi, UINT 
     if (hasStoredPlacement && stored.dpi > 0U) {
         desiredWidth = std::max(320, MulDiv(stored.width, static_cast<int>(dpi), static_cast<int>(stored.dpi)));
         desiredHeight = std::max(240, MulDiv(stored.height, static_cast<int>(dpi), static_cast<int>(stored.dpi)));
+    } else {
+        // Callers specify the client size required by their control layout. Add
+        // the standard resizable-dialog frame so the initial client area is not
+        // reduced by the caption, borders, or reserved scroll bars.
+        RECT framed{0, 0, desiredWidth, desiredHeight};
+        constexpr DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU |
+                                WS_THICKFRAME | WS_VSCROLL | WS_HSCROLL;
+        if (AdjustWindowRectEx(&framed, style, FALSE, 0)) {
+            desiredWidth = framed.right - framed.left;
+            desiredHeight = framed.bottom - framed.top;
+        }
     }
 
     HMONITOR monitor = MonitorFromWindow(owner, MONITOR_DEFAULTTONEAREST);
@@ -513,6 +524,7 @@ bool ProcessKeyboardDialogMessage(HWND dialog, MSG& message,
                     const DWORD childStyle = static_cast<DWORD>(GetWindowLongPtrW(child, GWL_STYLE));
                     if (_wcsicmp(childClass, L"Button") == 0 &&
                         (childStyle & BS_TYPEMASK) == BS_DEFPUSHBUTTON && IsWindowEnabled(child)) {
+                        if (!IsWindowVisible(child)) continue;
                         defaultButton = child;
                         break;
                     }

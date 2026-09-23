@@ -1,0 +1,25 @@
+# CMake and compiler output
+/build/
+/build-*/
+/out/
+/dist/
+/artifacts/
+/test_artifacts/
+CMakeUserPresets.json
+
+# Visual Studio and IDE state
+/.vs/
+*.user
+*.suo
+*.VC.db
+*.VC.opendb
+/.idea/
+/.vscode/
+
+# Local application/test state
+*.log
+*.tmp
+*.bak
+Thumbs.db
+.DS_Store
+/dec029-boost-multiprecision-package-review-source/

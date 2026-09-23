@@ -105,14 +105,14 @@ EscapeResult CalculateNewton(double real, double imaginary, int maximumIteration
             int root = static_cast<int>(std::llround((angle < 0.0 ? angle + kTwoPi : angle) /
                                                      kTwoPi * degree)) % degree;
             if (root < 0) root += degree;
-            return {iteration, true, static_cast<double>(iteration), true, root, trap, 0.0};
+            return {iteration, true, static_cast<double>(iteration), true, root, trap, 0.0, 0.5};
         }
         const Complex derivative = static_cast<double>(degree) * PowInteger(z, degree - 1);
         if (std::abs(derivative) < 1.0e-300) break;
         z -= relaxation * residual / derivative;
         if (!std::isfinite(z.real()) || !std::isfinite(z.imag())) break;
     }
-    return {maximumIterations, false, static_cast<double>(maximumIterations), false, -1, trap, 0.0};
+    return {maximumIterations, false, static_cast<double>(maximumIterations), false, -1, trap, 0.0, 0.5};
 }
 
 bool SupportsDistanceDerivative(const EquationSettings& equation) {
@@ -121,7 +121,52 @@ bool SupportsDistanceDerivative(const EquationSettings& equation) {
            equation.reciprocalPower == 0;
 }
 
+bool NearlyEqual(double value, double expected) noexcept {
+    return std::abs(value - expected) <= 1.0e-12;
+}
+
+bool IsCoefficient(const ComplexCoefficient& coefficient,
+                   double real, double imaginary) noexcept {
+    return NearlyEqual(coefficient.real, real) &&
+           NearlyEqual(coefficient.imaginary, imaginary);
+}
+
+double JacobianSpectralNorm(const Complex& derivativeX,
+                            const Complex& derivativeY) noexcept {
+    // derivativeX and derivativeY are the two columns of the real 2x2
+    // Jacobian. The largest singular value is the appropriate local stretch
+    // for a non-analytic map and reduces to |dz/dc| for analytic maps.
+    const double trace = std::norm(derivativeX) + std::norm(derivativeY);
+    const double determinant = derivativeX.real() * derivativeY.imag() -
+                               derivativeY.real() * derivativeX.imag();
+    const double discriminant = std::max(
+        0.0, trace * trace - 4.0 * determinant * determinant);
+    const double largestEigenvalue = 0.5 * (trace + std::sqrt(discriminant));
+    if (!(largestEigenvalue > 0.0) || !std::isfinite(largestEigenvalue)) return 0.0;
+    return std::sqrt(largestEigenvalue);
+}
+
 } // namespace
+
+bool SupportsConjugateDistanceEstimation(const EquationSettings& equation) noexcept {
+    // Phase 2 deliberately supports only the exact power-2 Tricorn parameter
+    // map. More general anti-holomorphic Jacobians can be added after they have
+    // independent numeric fixtures rather than being inferred from this case.
+    return equation.renderMode == FractalRenderMode::EscapeTime &&
+           !equation.newtonMode && equation.conjugate && equation.power == 2 &&
+           equation.parameterPower == 1 && equation.reciprocalPower == 0 &&
+           !equation.absoluteReal && !equation.absoluteImaginary &&
+           !equation.swapRealImaginary &&
+           equation.unaryTransform == EquationUnaryTransform::None &&
+           equation.initialZMode == InitialZMode::Zero && !equation.juliaMode &&
+           !equation.animateCoefficients &&
+           IsCoefficient(equation.quadratic, 1.0, 0.0) &&
+           IsCoefficient(equation.linear, 0.0, 0.0) &&
+           IsCoefficient(equation.parameter, 1.0, 0.0) &&
+           IsCoefficient(equation.constant, 0.0, 0.0) &&
+           IsCoefficient(equation.iterationTerm, 0.0, 0.0) &&
+           IsCoefficient(equation.reciprocalCoefficient, 0.0, 0.0);
+}
 
 EscapeResult CalculateEscape(double real, double imaginary, int maximumIterations) {
     return CalculateEscape(real, imaginary, maximumIterations, EquationSettings{}, 0.0);
@@ -156,8 +201,13 @@ EscapeResult CalculateEscape(double real, double imaginary, int maximumIteration
     const Complex reciprocal = Animate(equation.reciprocalCoefficient, equation, timeSeconds, 5.5);
     const double bailoutSquared = equation.bailoutRadius * equation.bailoutRadius;
     double trap = std::numeric_limits<double>::infinity();
+    double stripeSum = 0.0;
+    int stripeSamples = 0;
     Complex derivative = equation.juliaMode ? Complex{1.0, 0.0} : Complex{};
+    Complex derivativeX{};
+    Complex derivativeY{};
     const bool trackDerivative = SupportsDistanceDerivative(equation);
+    const bool trackConjugateJacobian = SupportsConjugateDistanceEstimation(equation);
 
     int iteration = 0;
     double magnitudeSquared = std::norm(z);
@@ -165,6 +215,10 @@ EscapeResult CalculateEscape(double real, double imaginary, int maximumIteration
         magnitudeSquared = std::norm(z);
         if (magnitudeSquared > bailoutSquared) break;
         trap = std::min(trap, TrapDistance(z, equation));
+        if (equation.stripeAverageEnabled && iteration >= equation.stripeStartIteration) {
+            stripeSum += 0.5 + 0.5 * std::sin(equation.stripeDensity * std::arg(z) + equation.stripePhase);
+            ++stripeSamples;
+        }
         const Complex w = ApplyTransform(z, equation);
         const Complex powered = PowInteger(w, equation.power);
         const Complex poweredParameter = PowInteger(c, equation.parameterPower);
@@ -173,7 +227,7 @@ EscapeResult CalculateEscape(double real, double imaginary, int maximumIteration
         if (equation.reciprocalPower > 0 && std::abs(reciprocal) > 1.0e-14) {
             const Complex denominator = PowInteger(w, equation.reciprocalPower);
             if (std::abs(denominator) < 1.0e-300) {
-                return {iteration + 1, true, static_cast<double>(iteration + 1), false, -1, trap, 0.0};
+                return {iteration + 1, true, static_cast<double>(iteration + 1), false, -1, trap, 0.0, 0.5};
             }
             next += reciprocal / denominator;
         }
@@ -186,14 +240,23 @@ EscapeResult CalculateEscape(double real, double imaginary, int maximumIteration
                                       PowInteger(c, equation.parameterPower - 1);
             }
             derivative = localDerivative * derivative + parameterDerivative;
+        } else if (trackConjugateJacobian) {
+            // z(n+1) = conjugate(z(n))^2 + c. Differentiate with
+            // respect to the two real pixel axes. Conjugation makes the map
+            // non-analytic, so one complex derivative is not sufficient.
+            const Complex localDerivative = 2.0 * w;
+            derivativeX = localDerivative * std::conj(derivativeX) +
+                          Complex{1.0, 0.0};
+            derivativeY = localDerivative * std::conj(derivativeY) +
+                          Complex{0.0, 1.0};
         }
         z = next;
         if (!std::isfinite(z.real()) || !std::isfinite(z.imag())) {
-            return {iteration + 1, true, static_cast<double>(iteration + 1), false, -1, trap, 0.0};
+            return {iteration + 1, true, static_cast<double>(iteration + 1), false, -1, trap, 0.0, 0.5};
         }
     }
     if (iteration >= maximumIterations) {
-        return {maximumIterations, false, static_cast<double>(maximumIterations), false, -1, trap, 0.0};
+        return {maximumIterations, false, static_cast<double>(maximumIterations), false, -1, trap, 0.0, 0.5};
     }
 
     magnitudeSquared = std::norm(z);
@@ -207,14 +270,23 @@ EscapeResult CalculateEscape(double real, double imaginary, int maximumIteration
         }
     }
     double distance = 0.0;
-    const double derivativeMagnitude = std::abs(derivative);
+    double derivativeMagnitude = 0.0;
+    if (trackDerivative) {
+        derivativeMagnitude = std::abs(derivative);
+    } else if (trackConjugateJacobian) {
+        derivativeMagnitude = JacobianSpectralNorm(derivativeX, derivativeY);
+    }
     const double magnitude = std::sqrt(std::max(0.0, magnitudeSquared));
-    if (trackDerivative && derivativeMagnitude > 1.0e-300 && magnitude > 1.0) {
+    if (derivativeMagnitude > 1.0e-300 && std::isfinite(derivativeMagnitude) &&
+        magnitude > 1.0) {
         distance = 0.5 * std::log(magnitude) * magnitude / derivativeMagnitude;
         if (!std::isfinite(distance) || distance < 0.0) distance = 0.0;
     }
+    const double stripeAverage = stripeSamples > 0
+        ? std::clamp(stripeSum / static_cast<double>(stripeSamples), 0.0, 1.0)
+        : 0.5;
     return {iteration, true, std::isfinite(smooth) ? smooth : static_cast<double>(iteration),
-            false, -1, trap, distance};
+            false, -1, trap, distance, stripeAverage};
 }
 
 bool IsInterestingMandelbrotTarget(double real, double imaginary, int maximumIterations) {
